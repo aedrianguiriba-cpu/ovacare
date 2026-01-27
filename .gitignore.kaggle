@@ -1,0 +1,109 @@
+# Kaggle API Security
+# Never commit credentials to version control!
+
+# Environment files with sensitive data
+.env
+.env.local
+.env.*.local
+
+# Kaggle credentials
+kaggle.json
+kaggle_credentials.json
+
+# IDE files that might contain credentials
+.vscode/settings.json
+.idea/misc.xml
+
+# Build and dependency directories
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+
+# iOS/macOS
+ios/Flutter/Flutter.podspec
+macos/Flutter/Flutter-Debug.xcconfig
+macos/Flutter/Flutter-Release.xcconfig
+
+# Android
+android/.gradle/
+android/app/debug/
+android/app/release/
+
+# Web
+web/flutter_service_worker.js
+
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.buildlog/
+.history
+.svn/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Flutter/Dart/Pub specific
+doc/api/
+.dart_tool/
+.packages
+pubspec.lock
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# iOS/macOS
+**/ios/**/*.mode1v3
+**/ios/**/*.mode2v3
+**/ios/**/*.moved-aside
+**/ios/**/*.pbxuser
+**/ios/**/*.perspectivev3
+**/ios/**/*.xcbkptlist
+**/ios/**/*.xcworkspace/xcuserdata/
+**/ios/**/*.xcworkspace/xcshareddata/
+**/ios/**/Flutter/Flutter.podspec
+**/ios/**/Flutter/Flutter.xcconfig
+**/ios/**/Flutter/flutter_assets/
+**/ios/**/Flutter/flutter_export_environment.sh
+**/ios/Flutter/.last_build_id
+**/ios/Flutter/Flutter.xcframework
+**/ios/Flutter/Flutter.xcframework/**
+**/ios/Flutter/Flutter.modulemap
+**/ios/Flutter/GeneratedPluginRegistrant.swift
+**/ios/Flutter/GeneratedPluginRegistrant.m
+**/ios/Flutter/ephemeral/
+**/ios/Flutter/app.flx
+**/ios/Flutter/app.zip
+**/ios/Flutter/flutter_assets/
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/Flutter/flutter_exports.sh
+**/ios/Flutter/ios-release.zip
+**/ios/Flutter/Flutter.framework/
+**/ios/Flutter/Flutter.xcframework
+**/ios/Flutter/Flutter.xcframework/**
+
+# Exceptions - DO include these in version control
+!.gitignore
+!.gitattributes
+!pubspec.yaml
+!pubspec.lock (if desired for reproducible builds)
+!.env.example (template file)
