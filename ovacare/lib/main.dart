@@ -29,7 +29,7 @@ class WaveIndicatorPainter extends CustomPainter {
       final path = Path();
       final waveAmplitude = 3.0 + layer;
       final frequency = 0.02 + (layer * 0.005);
-      final phaseOffset = wavePhase + (layer * 0.5);
+      final phaseOffset = wavePhase + (layer * 0.5);123
 
       // Start from top
       path.moveTo(width * 0.5, 0);
