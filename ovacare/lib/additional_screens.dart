@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'ai_moderation_service.dart';
+import 'dialog_helper.dart';
 
 // ============== COMMUNITY FORUM (Reddit-like) ==============
 
@@ -14,6 +15,7 @@ class CommunityForumScreen extends StatefulWidget {
 class _CommunityForumScreenState extends State<CommunityForumScreen> {
   String _sortBy = 'hot'; // hot, new, top
   List<ForumPost> _posts = [];
+  bool _showSummary = false; // Toggle for summary visibility
   final List<String> _availableTags = ['Support', 'Treatment', 'Diet', 'Exercise', 'Symptoms', 'Lifestyle', 'Question', 'NewDiagnosis', 'Medication', 'Mental Health'];
 
   @override
@@ -54,12 +56,30 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
             ),
           ),
           Divider(height: 1, color: Colors.grey[300]),
-          // Posts list
+          // Summary toggle button
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: ElevatedButton.icon(
+              onPressed: () => setState(() => _showSummary = !_showSummary),
+              icon: Icon(_showSummary ? Icons.expand_less : Icons.expand_more),
+              label: Text(_showSummary ? 'Hide Summary' : 'Show Summary'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.pink[100],
+                foregroundColor: Colors.pink[800],
+              ),
+            ),
+          ),
+          // Posts list with optional summary
           Expanded(
             child: ListView.builder(
-              itemCount: sortedPosts.length,
+              itemCount: sortedPosts.length + (_showSummary ? 1 : 0),
               itemBuilder: (context, index) {
-                return _buildPostCard(sortedPosts[index], index);
+                // Show summary at the top if enabled
+                if (_showSummary && index == 0) {
+                  return _buildDailySummary(sortedPosts);
+                }
+                final postIndex = _showSummary ? index - 1 : index;
+                return _buildPostCard(sortedPosts[postIndex], postIndex);
               },
             ),
           ),
@@ -85,6 +105,80 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
       onPressed: () => setState(() => _sortBy = sortValue),
       child: Text(label),
     );
+  }
+
+  /// Get color based on relevance score for visual feedback
+  Color _getRelevanceColor(double score) {
+    if (score >= 70) return Colors.green; // High relevance
+    if (score >= 50) return Colors.orange; // Medium relevance
+    return Colors.amber; // Lower relevance but acceptable
+  }
+
+  /// Build summary of all posts
+  Widget _buildDailySummary(List<ForumPost> posts) {
+    if (posts.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    // Calculate statistics
+    final totalPosts = posts.length;
+    final totalUpvotes = posts.fold<int>(0, (sum, p) => sum + p.upvotes);
+    final totalComments = posts.fold<int>(0, (sum, p) => sum + p.comments);
+    final highRelevance = posts.where((p) => (p.relevanceScore ?? 0) >= 70).length;
+    
+    // Get main topics
+    final topics = <String, int>{};
+    for (final post in posts) {
+      if (post.primaryTopic != null) {
+        topics[post.primaryTopic!] = (topics[post.primaryTopic!] ?? 0) + 1;
+      }
+    }
+    final topTopics = topics.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+
+    final summaryText = _generateSummaryText(totalPosts, highRelevance, totalUpvotes, totalComments, topTopics);
+
+    return Padding(
+      padding: const EdgeInsets.all(12),
+      child: Card(
+        color: Colors.pink[50],
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                "📝 Forum Summary",
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Colors.black87),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                summaryText,
+                style: const TextStyle(fontSize: 12, color: Colors.black87, height: 1.6),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Generate comprehensive summary text explaining all posts
+  String _generateSummaryText(int totalPosts, int highRelevance, int totalUpvotes, int totalComments, List<MapEntry<String, int>> topTopics) {
+    final buffer = StringBuffer();
+    
+    buffer.write('This PCOS community forum has $totalPosts active discussions with $totalUpvotes upvotes and $totalComments comments. ');
+    buffer.write('$highRelevance posts are high-quality, PCOS-focused content. ');
+    
+    if (topTopics.isNotEmpty) {
+      buffer.write('Main discussion topics include: ');
+      final topicsList = topTopics.take(3).map((t) => '${t.key} (${t.value} posts)').join(', ');
+      buffer.write('$topicsList. ');
+    }
+    
+    buffer.write('Members share experiences, ask questions, and support each other in managing PCOS symptoms and treatments.');
+    
+    return buffer.toString();
   }
 
   Widget _buildPostCard(ForumPost post, int index) {
@@ -155,6 +249,66 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
                 overflow: TextOverflow.ellipsis,
               ),
               const SizedBox(height: 12),
+              // AI Relevance Indicator and Primary Topic
+              if (post.isPcosRelevant && post.relevanceScore != null && post.relevanceScore! > 0)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.verified_user,
+                        size: 16,
+                        color: _getRelevanceColor(post.relevanceScore ?? 0),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Text(
+                                  post.primaryTopic ?? 'PCOS Related',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: _getRelevanceColor(post.relevanceScore ?? 0),
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: _getRelevanceColor(post.relevanceScore ?? 0).withOpacity(0.15),
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Text(
+                                    '${(post.relevanceScore ?? 0).toStringAsFixed(0)}%',
+                                    style: TextStyle(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.bold,
+                                      color: _getRelevanceColor(post.relevanceScore ?? 0),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            if ((post.detectedPcosTerms?.length ?? 0) > 0)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 4),
+                                child: Text(
+                                  'Detected: ${post.detectedPcosTerms!.take(2).join(", ")}${post.detectedPcosTerms!.length > 2 ? ' +${post.detectedPcosTerms!.length - 2}' : ''}',
+                                  style: TextStyle(fontSize: 10, color: Colors.grey[600]),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               // Tags
               Wrap(
                 spacing: 8,
@@ -246,28 +400,51 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
     );
   }
 
-  /// Analyzes post content for PCOS relevance using pure Dart AI verification
-  /// Returns a map with 'approved' (bool) and 'reason' (String) keys
+  /// Analyzes post content for PCOS relevance using advanced AI verification
+  /// Returns a map with 'approved' (bool) and detailed analysis data
   Future<Map<String, dynamic>> _analyzePostRelevance(String title, String content) async {
     try {
-      // Call pure Dart verifier service (no backend required)
-      final result = await AIModerationService.verifyPcosContent(title, content);
+      // Use advanced forum relevance analyzer
+      final result = await ForumRelevanceAnalyzer.analyzeForum(title, content);
+      
       return {
-        'approved': result.approved,
-        'reason': result.reason,
+        'approved': result.isRelevant,
+        'reason': result.feedback,
         'score': result.relevanceScore,
-        'terms_found': result.termsFound,
         'suggested_tags': result.suggestedTags,
+        'primary_topic': result.primaryTopic,
+        'detected_terms': result.detectedTerms,
+        'confidence': result.confidence,
+        'content_quality': result.contentQualityMetrics,
       };
     } catch (e) {
-      print('Moderation error: $e');
-      return {
-        'approved': false,
-        'reason': 'Content verification failed. Please try again.',
-        'score': 0.0,
-        'terms_found': [],
-        'suggested_tags': [],
-      };
+      print('Forum relevance analysis error: $e');
+      // Fallback to basic content verification
+      try {
+        final basicResult = await AIModerationService.verifyPcosContent(title, content);
+        return {
+          'approved': basicResult.approved,
+          'reason': basicResult.reason,
+          'score': basicResult.relevanceScore,
+          'suggested_tags': basicResult.suggestedTags,
+          'primary_topic': 'General Discussion',
+          'detected_terms': basicResult.termsFound,
+          'confidence': basicResult.confidence,
+          'content_quality': {},
+        };
+      } catch (fallbackError) {
+        print('Fallback moderation error: $fallbackError');
+        return {
+          'approved': false,
+          'reason': 'Content verification failed. Please try again.',
+          'score': 0.0,
+          'suggested_tags': [],
+          'primary_topic': 'Unknown',
+          'detected_terms': [],
+          'confidence': 0.0,
+          'content_quality': {},
+        };
+      }
     }
   }
 
@@ -439,19 +616,76 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
                         style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
                         onPressed: () async {
                           if (titleController.text.isNotEmpty && contentController.text.isNotEmpty) {
-                            // Show loading dialog
+                            // Show enhanced loading dialog
                             showDialog(
                               context: context,
                               barrierDismissible: false,
-                              builder: (dialogCtx) => const AlertDialog(
-                                title: Text('Analyzing Post'),
-                                content: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    CircularProgressIndicator(),
-                                    SizedBox(height: 16),
-                                    Text('Checking for PCOS relevance...'),
-                                  ],
+                              builder: (dialogCtx) => Dialog(
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(16),
+                                ),
+                                elevation: 8,
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    borderRadius: BorderRadius.circular(16),
+                                    gradient: LinearGradient(
+                                      begin: Alignment.topLeft,
+                                      end: Alignment.bottomRight,
+                                      colors: [Colors.blue[50]!, Colors.purple[50]!],
+                                    ),
+                                  ),
+                                  padding: const EdgeInsets.all(24),
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Container(
+                                        padding: const EdgeInsets.all(12),
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          color: Colors.white.withOpacity(0.7),
+                                        ),
+                                        child: const SizedBox(
+                                          height: 40,
+                                          width: 40,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 3,
+                                            valueColor: AlwaysStoppedAnimation<Color>(
+                                              Color(0xFF8B5CF6),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 20),
+                                      const Text(
+                                        'Analyzing Post',
+                                        style: TextStyle(
+                                          fontSize: 18,
+                                          fontWeight: FontWeight.bold,
+                                          color: Color(0xFF1F2937),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 8),
+                                      const Text(
+                                        'Using AI to verify PCOS relevance...',
+                                        textAlign: TextAlign.center,
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          color: Color(0xFF6B7280),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 16),
+                                      ClipRRect(
+                                        borderRadius: BorderRadius.circular(4),
+                                        child: LinearProgressIndicator(
+                                          minHeight: 4,
+                                          backgroundColor: Colors.grey[300],
+                                          valueColor: AlwaysStoppedAnimation<Color>(
+                                            Colors.blue[400]!,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
                                 ),
                               ),
                             );
@@ -466,19 +700,57 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
                             Navigator.pop(context);
 
                             if (!(moderation['approved'] as bool)) {
-                              // Show rejection dialog
+                              // Show detailed rejection dialog with AI analysis
                               showDialog(
                                 context: context,
                                 builder: (dialogCtx) => AlertDialog(
-                                  title: const Text('Post Rejected'),
-                                  content: Text(moderation['reason'] as String),
+                                  title: const Text('Post Needs Adjustment'),
+                                  content: SingleChildScrollView(
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          moderation['reason'] as String,
+                                          style: const TextStyle(fontSize: 14),
+                                        ),
+                                        const SizedBox(height: 16),
+                                        // Show AI suggestions if available
+                                        if ((moderation['detected_terms'] as List?)?.isNotEmpty ?? false)
+                                          Padding(
+                                            padding: const EdgeInsets.only(top: 8),
+                                            child: Column(
+                                              crossAxisAlignment: CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  'Suggestions to improve:',
+                                                  style: TextStyle(
+                                                    fontSize: 12,
+                                                    fontWeight: FontWeight.w600,
+                                                    color: Colors.grey[600],
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 8),
+                                                Text(
+                                                  '• Include more PCOS-related terms (e.g., symptoms, treatment, hormones)\n• Provide more detail about your experience or question\n• Focus on health topics related to polycystic ovary syndrome',
+                                                  style: TextStyle(fontSize: 12, color: Colors.grey[700]),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  ),
                                   actions: [
                                     TextButton(
                                       onPressed: () => Navigator.pop(dialogCtx),
                                       child: const Text('Edit Post'),
                                     ),
                                     TextButton(
-                                      onPressed: () => Navigator.pop(dialogCtx),
+                                      onPressed: () {
+                                        Navigator.pop(dialogCtx);
+                                        Navigator.pop(ctx);
+                                      },
                                       child: const Text('Dismiss'),
                                     ),
                                   ],
@@ -502,7 +774,7 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
                                 tagsToUse = ['Discussion'];
                               }
 
-                              // Post approved - add to forum
+                              // Post approved - add to forum with AI analysis data
                               final newPost = ForumPost(
                                 id: _posts.length + 1,
                                 title: titleController.text,
@@ -513,13 +785,43 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
                                 downvotes: 0,
                                 comments: 0,
                                 tags: tagsToUse,
+                                // AI Analysis Fields
+                                relevanceScore: (moderation['score'] as num?)?.toDouble() ?? 0.0,
+                                primaryTopic: moderation['primary_topic'] as String? ?? 'General Discussion',
+                                detectedPcosTerms: (moderation['detected_terms'] as List<dynamic>?)?.cast<String>() ?? [],
+                                isPcosRelevant: true,
                               );
                               setState(() => _posts.insert(0, newPost));
                               Navigator.pop(ctx);
+                              
+                              // Show success with AI analysis details
+                              final primaryTopic = moderation['primary_topic'] as String? ?? 'General Discussion';
+                              final relevanceScore = (moderation['score'] as num?)?.toDouble() ?? 0.0;
+                              final scoreText = relevanceScore >= 70
+                                  ? '🔥 High PCOS relevance'
+                                  : relevanceScore >= 50
+                                      ? '✓ Good PCOS relevance'
+                                      : '✓ PCOS related';
+                              
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(
-                                  content: Text(moderation['reason'] as String),
+                                  content: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        moderation['reason'] as String,
+                                        style: const TextStyle(color: Colors.white),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        '$scoreText • $primaryTopic (${relevanceScore.toStringAsFixed(0)}%)',
+                                        style: const TextStyle(fontSize: 12, color: Colors.white70),
+                                      ),
+                                    ],
+                                  ),
                                   backgroundColor: Colors.green,
+                                  duration: const Duration(seconds: 4),
                                 ),
                               );
                             }
@@ -572,58 +874,64 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
   }
 
   void _showReportDialog(ForumPost post) {
-    showDialog(
+    DialogHelper.showConfirmationDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Report Post'),
-        content: const Text('Thank you for helping keep our community safe. Your report will be reviewed by our moderators.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
+      title: 'Report Post',
+      message: 'Thank you for helping keep our community safe. Your report will be reviewed by our moderators.',
+      confirmText: 'Report',
+      cancelText: 'Cancel',
+      icon: Icons.flag_rounded,
+      isDangerous: true,
+    ).then((confirmed) {
+      if (confirmed == true) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Row(
+              children: [
+                Icon(Icons.check_circle, color: Colors.white),
+                SizedBox(width: 8),
+                Text('Post reported. Thank you for your feedback.'),
+              ],
+            ),
+            backgroundColor: Colors.orange[600],
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
           ),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.pop(ctx);
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Post reported. Thank you for your feedback.')),
-              );
-            },
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            child: const Text('Report'),
-          ),
-        ],
-      ),
-    );
+        );
+      }
+    });
   }
 
   void _showDeleteConfirmation(ForumPost post, int index) {
-    showDialog(
+    DialogHelper.showConfirmationDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Delete Post'),
-        content: const Text('Are you sure you want to delete this post? This action cannot be undone.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
+      title: 'Delete Post',
+      message: 'Are you sure you want to delete this post? This action cannot be undone.',
+      confirmText: 'Delete',
+      cancelText: 'Cancel',
+      icon: Icons.delete_forever_rounded,
+      isDangerous: true,
+    ).then((confirmed) {
+      if (confirmed == true) {
+        setState(() {
+          _posts.removeAt(index);
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Row(
+              children: [
+                Icon(Icons.check_circle, color: Colors.white),
+                SizedBox(width: 8),
+                Text('Post deleted'),
+              ],
+            ),
+            backgroundColor: Colors.green[600],
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
           ),
-          ElevatedButton(
-            onPressed: () {
-              setState(() {
-                _posts.removeAt(index);
-              });
-              Navigator.pop(ctx);
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Post deleted')),
-              );
-            },
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
+        );
+      }
+    });
   }
 
   void _sharePost(ForumPost post) {
@@ -714,6 +1022,12 @@ class ForumPost {
   final int comments;
   final List<String> tags;
   final List<ForumComment> replies;
+  
+  // AI Relevance Detection Fields
+  final double? relevanceScore;
+  final String? primaryTopic;
+  final List<String>? detectedPcosTerms;
+  final bool isPcosRelevant;
 
   ForumPost({
     required this.id,
@@ -726,6 +1040,10 @@ class ForumPost {
     required this.comments,
     required this.tags,
     this.replies = const [],
+    this.relevanceScore,
+    this.primaryTopic,
+    this.detectedPcosTerms,
+    this.isPcosRelevant = true,
   });
 
   int get score => upvotes - downvotes;
@@ -986,42 +1304,29 @@ class _ForumPostPageState extends State<ForumPostPage> {
   }
 
   void _showAddCommentDialog() {
-    final controller = TextEditingController();
-    showDialog(
+    DialogHelper.showInputDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Add Comment'),
-        content: TextField(
-          controller: controller,
-          decoration: const InputDecoration(labelText: 'Comment', border: OutlineInputBorder()),
-          maxLines: 4,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              if (controller.text.isNotEmpty) {
-                final newComment = ForumComment(
-                  id: _comments.length + 1,
-                  author: 'You',
-                  content: controller.text,
-                  postedTime: DateTime.now(),
-                  upvotes: 0,
-                  downvotes: 0,
-                );
-                setState(() => _comments.insert(0, newComment));
-                Navigator.pop(ctx);
-              }
-            },
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
-            child: const Text('Post'),
-          ),
-        ],
-      ),
-    );
+      title: 'Add Comment',
+      subtitle: 'Share your thoughts with the community',
+      hintText: 'Write your comment here...',
+      confirmText: 'Post',
+      cancelText: 'Cancel',
+      icon: Icons.chat_bubble_outline_rounded,
+      iconColor: Colors.pink[400],
+      maxLines: 4,
+    ).then((text) {
+      if (text != null && text.isNotEmpty) {
+        final newComment = ForumComment(
+          id: _comments.length + 1,
+          author: 'You',
+          content: text,
+          postedTime: DateTime.now(),
+          upvotes: 0,
+          downvotes: 0,
+        );
+        setState(() => _comments.insert(0, newComment));
+      }
+    });
   }
 
   void _voteOnPost(int vote) {
@@ -1104,72 +1409,45 @@ class _ForumPostPageState extends State<ForumPostPage> {
   }
 
   void _showReplyDialog(ForumComment parentComment) {
-    final controller = TextEditingController();
-    showDialog(
+    DialogHelper.showInputDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('Reply to u/${parentComment.author}'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.grey[100],
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.grey[300]!),
-              ),
-              child: Text(
-                parentComment.content,
-                style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-                maxLines: 3,
-                overflow: TextOverflow.ellipsis,
-              ),
+      title: 'Reply to u/${parentComment.author}',
+      subtitle: 'Share your thoughts on this comment',
+      hintText: 'What are your thoughts?',
+      confirmText: 'Reply',
+      cancelText: 'Cancel',
+      icon: Icons.reply_rounded,
+      iconColor: Colors.pink[400],
+      maxLines: 3,
+    ).then((text) {
+      if (text != null && text.isNotEmpty) {
+        final newReply = ForumComment(
+          id: DateTime.now().millisecondsSinceEpoch,
+          author: 'You',
+          content: text,
+          postedTime: DateTime.now(),
+          upvotes: 1, // Self upvote
+          downvotes: 0,
+        );
+        setState(() {
+          parentComment.replies.add(newReply);
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Row(
+              children: [
+                Icon(Icons.check_circle, color: Colors.white),
+                SizedBox(width: 8),
+                Text('Reply posted successfully!'),
+              ],
             ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: controller,
-              decoration: const InputDecoration(
-                labelText: 'Your reply',
-                border: OutlineInputBorder(),
-                hintText: 'What are your thoughts?'
-              ),
-              maxLines: 3,
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
+            backgroundColor: Colors.green[600],
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
           ),
-          ElevatedButton(
-            onPressed: () {
-              if (controller.text.isNotEmpty) {
-                final newReply = ForumComment(
-                  id: DateTime.now().millisecondsSinceEpoch,
-                  author: 'You',
-                  content: controller.text,
-                  postedTime: DateTime.now(),
-                  upvotes: 1, // Self upvote
-                  downvotes: 0,
-                );
-                setState(() {
-                  parentComment.replies.add(newReply);
-                });
-                Navigator.pop(ctx);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Reply posted successfully!')),
-                );
-              }
-            },
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
-            child: const Text('Reply'),
-          ),
-        ],
-      ),
-    );
+        );
+      }
+    });
   }
 
   void _sharePostFromDetail() async {

@@ -5,9 +5,13 @@ import 'package:provider/provider.dart';
 import 'dart:math' as math;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:youtube_player_flutter/youtube_player_flutter.dart';
 import 'additional_screens.dart';
 import 'data_service.dart';
 import 'services/kaggle_data_service.dart';
+import 'pcos_screening_quiz.dart';
+import 'config/gemini_config.dart';
+import 'dialog_helper.dart';
 
 // Wave Indicator Painter for animated water effect
 class WaveIndicatorPainter extends CustomPainter {
@@ -57,31 +61,67 @@ class WaveIndicatorPainter extends CustomPainter {
 void main() async {
   // Load environment variables from .env file
   // Try multiple paths since working directory can vary
-  try {
-    await dotenv.load(fileName: ".env");
-  } catch (e) {
+  bool envLoaded = false;
+  
+  // Try common paths
+  final possiblePaths = [
+    ".env",
+    "ovacare/.env",
+    "../.env",
+    "../../.env",
+  ];
+  
+  for (final path in possiblePaths) {
     try {
-      await dotenv.load(fileName: "ovacare/.env");
-    } catch (e2) {
-      // .env file not found or couldn't be loaded
-      // App will continue with environment variables from system
-      print('Warning: Could not load .env file. Using system environment variables.');
+      await dotenv.load(fileName: path);
+      print('✅ Loaded .env from: $path');
+      envLoaded = true;
+      break;
+    } catch (e) {
+      // Try next path
     }
   }
+  
+  if (!envLoaded) {
+    print('⚠️ Warning: Could not load .env file. Using system environment variables or hardcoded values.');
+    print('📝 To fix: Ensure .env file is in the project root (d:\\Documents\\web\\ovacare\\ovacare\\.env)');
+    // Initialize Gemini with null (will use offline mode)
+    try {
+      await dotenv.load(fileName: ".env");
+    } catch (e) {
+      // App will continue - GeminiConfig handles missing env gracefully
+    }
+  }
+  
+  // Initialize Gemini AI
+  GeminiConfig.initialize();
   
   // Initialize Kaggle Data Service
   // This will attempt to connect to Kaggle API
   // If credentials are not configured, it will fall back to embedded datasets
   KaggleDataService.initialize();
   
-  // Log Kaggle service status
+  // Log service statuses
+  print('AI Service: ${GeminiConfig.getStatus()}');
   print('Kaggle Service Status: ${KaggleDataService.getStatus()}');
   
   runApp(const OvaCareApp());
 }
 
-class OvaCareApp extends StatelessWidget {
+class OvaCareApp extends StatefulWidget {
   const OvaCareApp({super.key});
+
+  @override
+  State<OvaCareApp> createState() => _OvaCareAppState();
+}
+
+class _OvaCareAppState extends State<OvaCareApp> {
+  bool _screeningComplete = false;
+
+  @override
+  void initState() {
+    super.initState();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -98,14 +138,25 @@ class OvaCareApp extends StatelessWidget {
           useMaterial3: true,
         ),
         routes: {
-          '/': (context) => Consumer<AuthProvider>(
-            builder: (context, auth, _) {
-              if (auth.isLoggedIn) {
-                return const DashboardScreen();
-              }
-              return const LoginScreen();
-            },
-          ),
+          '/': (context) {
+            // If screening is not complete, show it first
+            if (!_screeningComplete) {
+              return PCOSScreeningQuiz(
+                onComplete: () {
+                  setState(() => _screeningComplete = true);
+                },
+              );
+            }
+            // Otherwise show login/dashboard
+            return Consumer<AuthProvider>(
+              builder: (context, auth, _) {
+                if (auth.isLoggedIn) {
+                  return const DashboardScreen();
+                }
+                return const LoginScreen();
+              },
+            );
+          },
           '/dashboard': (context) => const DashboardScreen(),
           '/signup': (context) => const SignUpScreen(),
         },
@@ -202,6 +253,68 @@ class HealthDataProvider extends ChangeNotifier {
     menstrualCycles.insert(0, {'start': start, 'end': end, 'flow': flow, 'notes': notes});
     _updateRiskAssessment();
     notifyListeners();
+  }
+
+  // Clear all cycle history
+  void clearCycleHistory() {
+    menstrualCycles.clear();
+    _updateRiskAssessment();
+    notifyListeners();
+  }
+
+  // Calculate predicted next period based on cycle history
+  DateTime? getNextPeriodPrediction() {
+    if (menstrualCycles.length < 2) {
+      // Need at least 2 cycles to predict
+      return null;
+    }
+
+    // Get the most recent cycle start
+    final recentCycle = menstrualCycles.first;
+    final lastPeriodStart = recentCycle['start'] as DateTime;
+
+    // Calculate average cycle length from recent cycles
+    final cycleLengths = <int>[];
+    for (int i = 0; i < menstrualCycles.length - 1; i++) {
+      final current = (menstrualCycles[i]['start'] as DateTime);
+      final next = (menstrualCycles[i + 1]['start'] as DateTime);
+      final diff = current.difference(next).inDays.abs();
+      if (diff > 0 && diff < 100) {
+        // Filter out anomalies (0 days or > 100 days)
+        cycleLengths.add(diff);
+      }
+    }
+
+    if (cycleLengths.isEmpty) {
+      // No valid cycles, use average of 28 days
+      return lastPeriodStart.add(const Duration(days: 28));
+    }
+
+    // Use weighted average (recent cycles matter more)
+    final n = cycleLengths.length;
+    double weightedSum = 0;
+    int weightTotal = 0;
+    for (int i = 0; i < n; i++) {
+      final weight = n - i; // recent cycles weigh more
+      weightedSum += cycleLengths[i] * weight;
+      weightTotal += weight;
+    }
+    final avgCycleLength = (weightedSum / weightTotal).round();
+
+    // Predict next period
+    return lastPeriodStart.add(Duration(days: avgCycleLength));
+  }
+
+  // Get days until next predicted period
+  int? getDaysUntilNextPeriod() {
+    final nextPeriod = getNextPeriodPrediction();
+    if (nextPeriod == null) return null;
+    
+    final today = DateTime.now();
+    final todayNormalized = DateTime(today.year, today.month, today.day);
+    final nextNormalized = DateTime(nextPeriod.year, nextPeriod.month, nextPeriod.day);
+    
+    return nextNormalized.difference(todayNormalized).inDays;
   }
 
   // Keep cycles sorted by start date descending (most recent first)
@@ -397,16 +510,32 @@ class HealthDataProvider extends ChangeNotifier {
         String datasetComparison = '';
         String confidenceNote = '';
 
+        // Helper function to describe variation in plain language
+        String getVariationDescription(double stdDev) {
+          if (stdDev <= 2) {
+            return 'Your cycles vary by only 1-2 days - that\'s excellent!';
+          } else if (stdDev <= 4) {
+            return 'Your cycles vary by about ${stdDev.round()} days on average - this is normal.';
+          } else if (stdDev <= 7) {
+            return 'Your cycles vary by about ${stdDev.round()} days - slightly unpredictable.';
+          } else if (stdDev <= 10) {
+            return 'Your cycles vary by about ${stdDev.round()} days - moderately irregular.';
+          } else {
+            return 'Your cycles vary by ${stdDev.round()}+ days - quite unpredictable.';
+          }
+        }
+
         // ===== CRITICAL: Only assess after 6 months of tracking =====
         if (trackingMonths < 6) {
           // Less than 6 months - show "Assessing" status
           regularitySeverity = 'Low';
           cycleRegularityScore = 0.0; // Don't count toward overall risk
           final daysUntilAssessment = (180 - trackingDays).clamp(0, 180);
-          regularityDesc = 'Assessment in progress. Please track for 6 months to get accurate cycle regularity assessment. '
-              'You have ${trackingMonths.toStringAsFixed(1)} months of data (need 6 months). '
-              'Check back in approximately ${daysUntilAssessment} days.';
-          confidenceNote = ' (Data collection phase - assessment available after 6 months)';
+          final weeksLeft = (daysUntilAssessment / 7).round();
+          regularityDesc = '📊 Still gathering data! You\'ve been tracking for ${trackingMonths.toStringAsFixed(0)} months. '
+              'We need about 6 months of cycle data to give you an accurate regularity assessment. '
+              'Keep logging - only about $weeksLeft weeks to go!';
+          confidenceNote = ' (Learning your patterns...)';
         } else {
           // 6+ months - now show real assessment
           // Adjust thresholds based on sample size after 3 months
@@ -415,22 +544,28 @@ class HealthDataProvider extends ChangeNotifier {
           double highRiskThreshold = 12.0;
           double moderateRiskThreshold = 6.0;
 
+          // Create user-friendly confidence message
+          String confidenceEmoji = '📈';
           if (cycleCount < 4) {
             // 3 months but only a few cycles - still developing
             highRiskThreshold = 18.0;
             moderateRiskThreshold = 9.0;
-            confidenceNote = ' (${trackingMonths.toStringAsFixed(1)} months tracked - ${cycleCount} cycles)';
+            confidenceEmoji = '📊';
+            confidenceNote = '\n\n💡 Based on $cycleCount cycles over ${trackingMonths.toStringAsFixed(0)} months. More cycles = more accurate results!';
           } else if (cycleCount < 6) {
             // 3-4 months, good cycle count
             highRiskThreshold = 15.0;
             moderateRiskThreshold = 8.0;
-            confidenceNote = ' (${trackingMonths.toStringAsFixed(1)} months tracked - ${cycleCount} cycles)';
+            confidenceEmoji = '📈';
+            confidenceNote = '\n\n💡 Based on $cycleCount cycles. Keep tracking for even better insights!';
           } else {
             // 5+ cycles (usually 5+ months) - high confidence
-            confidenceNote = ' (${trackingMonths.toStringAsFixed(1)} months tracked - ${cycleCount} cycles - High confidence)';
+            confidenceEmoji = '✅';
+            confidenceNote = '\n\n✅ High confidence: Based on $cycleCount cycles over ${trackingMonths.toStringAsFixed(0)} months of data.';
           }
 
           // Compare with dataset if available
+          String comparisonNote = '';
           if (_populationData != null) {
             final populationStdDev = _populationData!.stdDevCycleLength;
 
@@ -438,10 +573,12 @@ class HealthDataProvider extends ChangeNotifier {
               // Good data - use strict dataset comparison
               if (stdDev > populationStdDev * 3.0) {
                 regularitySeverity = 'High';
-                datasetComparison = ' Your variation is 3x higher than population average (${populationStdDev.toStringAsFixed(1)}).';
+                comparisonNote = ' This is about 3x more variable than most women experience.';
               } else if (stdDev > populationStdDev * 2.0) {
                 regularitySeverity = 'Moderate';
-                datasetComparison = ' Your variation is 2x higher than typical (${populationStdDev.toStringAsFixed(1)}).';
+                comparisonNote = ' This is about 2x more variable than typical.';
+              } else {
+                comparisonNote = ' This is within the normal range for most women.';
               }
             } else {
               // Limited data - use thresholds instead
@@ -450,7 +587,6 @@ class HealthDataProvider extends ChangeNotifier {
               } else if (stdDev > moderateRiskThreshold) {
                 regularitySeverity = 'Moderate';
               }
-              datasetComparison = ' (Population reference: ${populationStdDev.toStringAsFixed(1)} stdDev)';
             }
           } else {
             // Use standard thresholds if no population data
@@ -461,12 +597,25 @@ class HealthDataProvider extends ChangeNotifier {
             }
           }
 
+          // Generate user-friendly descriptions
+          final variationDesc = getVariationDescription(stdDev);
+          final avgCycleDays = avgLength.round();
+          
           if (regularitySeverity == 'Low') {
-            regularityDesc = 'Cycle length is stable and consistent (StdDev: ${stdDev.toStringAsFixed(1)} days). Your cycles align well with healthy patterns.$confidenceNote';
+            regularityDesc = '$confidenceEmoji Great news! Your cycles are regular and predictable.\n\n'
+                '• Average cycle: $avgCycleDays days\n'
+                '• $variationDesc\n'
+                '• This pattern is healthy and normal!$confidenceNote';
           } else if (regularitySeverity == 'Moderate') {
-            regularityDesc = 'Moderate variation in cycle length (StdDev: ${stdDev.toStringAsFixed(1)} days). Some irregularity present.$datasetComparison$confidenceNote';
+            regularityDesc = '$confidenceEmoji Your cycles show some variation - worth monitoring.\n\n'
+                '• Average cycle: $avgCycleDays days\n'
+                '• $variationDesc$comparisonNote\n'
+                '• Some irregular cycles are common and not always a concern. Stress, diet, and sleep can all affect cycle timing.$confidenceNote';
           } else {
-            regularityDesc = 'Significant variation in cycle length (StdDev: ${stdDev.toStringAsFixed(1)} days). Highly irregular cycles detected.$datasetComparison$confidenceNote';
+            regularityDesc = '⚠️ Your cycles are quite unpredictable.\n\n'
+                '• Average cycle: $avgCycleDays days\n'
+                '• $variationDesc$comparisonNote\n'
+                '• Very irregular cycles can sometimes indicate hormonal imbalances. Consider discussing with your healthcare provider if this pattern continues.$confidenceNote';
           }
         }
 
@@ -504,20 +653,29 @@ class HealthDataProvider extends ChangeNotifier {
 
       String weightSeverity = 'Low';
       String weightDesc = 'Weight is stable over recent entries.';
-      String datasetContext = '';
+      final currentWeightRounded = avgWeight.round();
+      final variationKg = weightStdDev.toStringAsFixed(1);
 
-      // Add dataset context - clinical studies show weight stability impact on cycles
+      // Add user-friendly weight stability descriptions
       if (weightStdDev > 6) {
         weightSeverity = 'High';
-        datasetContext = ' Clinical datasets show rapid weight changes (>6kg) significantly increase cycle irregularity risk.';
-        weightDesc = 'Significant weight fluctuations detected (±${weightStdDev.toStringAsFixed(1)}kg). Rapid weight changes affect hormonal balance and cycle regularity.$datasetContext';
+        weightDesc = '⚠️ Your weight has been fluctuating quite a bit.\n\n'
+            '• Current average: ${currentWeightRounded}kg\n'
+            '• Fluctuation: ±${variationKg}kg\n\n'
+            'Rapid weight changes (more than 6kg up or down) can affect your hormones and menstrual cycle. '
+            'If you\'re actively trying to lose or gain weight, gradual changes are healthier for your body.';
       } else if (weightStdDev > 3) {
         weightSeverity = 'Moderate';
-        datasetContext = ' Research indicates weight variance of 3-6kg can affect cycle patterns in 40% of women.';
-        weightDesc = 'Moderate weight variations observed (±${weightStdDev.toStringAsFixed(1)}kg). Small changes in weight can influence cycle patterns.$datasetContext';
+        weightDesc = '📊 Your weight shows some variation.\n\n'
+            '• Current average: ${currentWeightRounded}kg\n'
+            '• Fluctuation: ±${variationKg}kg\n\n'
+            'Moderate weight changes (3-6kg) can sometimes influence your cycle. This is common and usually not a concern. '
+            'Factors like water retention, diet changes, and exercise can cause normal fluctuations.';
       } else {
-        datasetContext = ' Studies show weight stability (±2kg or less) aligns with regular menstrual cycles.';
-        weightDesc = 'Weight is stable (±${weightStdDev.toStringAsFixed(1)}kg). Good weight stability supports hormonal health.$datasetContext';
+        weightDesc = '✅ Great job! Your weight is stable.\n\n'
+            '• Current average: ${currentWeightRounded}kg\n'
+            '• Fluctuation: ±${variationKg}kg\n\n'
+            'Keeping your weight stable (within 2-3kg) supports healthy hormone levels and regular cycles. Keep it up!';
       }
 
       factors.add({
@@ -574,17 +732,45 @@ class HealthDataProvider extends ChangeNotifier {
       String symptomSeverity = 'Low';
       String symptomDesc = 'Minimal PCOS-related symptoms reported.';
 
+      // Build list of detected symptoms for display
+      List<String> detectedSymptomTypes = [];
+      for (var s in recentSymptoms) {
+        if ((s['acne'] as bool?) == true && !detectedSymptomTypes.contains('acne')) detectedSymptomTypes.add('acne');
+        if ((s['bloating'] as bool?) == true && !detectedSymptomTypes.contains('bloating')) detectedSymptomTypes.add('bloating');
+        if ((s['hairGrowth'] as bool?) == true && !detectedSymptomTypes.contains('excess hair')) detectedSymptomTypes.add('excess hair');
+        if ((s['irregular'] as bool?) == true && !detectedSymptomTypes.contains('irregular periods')) detectedSymptomTypes.add('irregular periods');
+        final cramps = (s['cramps'] as num?)?.toInt() ?? 0;
+        if (cramps >= 5 && !detectedSymptomTypes.contains('severe cramps')) detectedSymptomTypes.add('severe cramps');
+        final mood = (s['mood'] as String?)?.toLowerCase() ?? '';
+        if (['anxious', 'stressed'].contains(mood) && !detectedSymptomTypes.contains('mood changes')) detectedSymptomTypes.add('mood changes');
+      }
+      final symptomsList = detectedSymptomTypes.take(4).join(', ');
+
       if (pcosSpecificCount >= 12) {
         symptomSeverity = 'High';
-        symptomDesc = 'Frequent PCOS-related symptoms detected ($pcosSpecificCount episodes). This pattern is strongly associated with PCOS and hormonal imbalances. Consider consulting with a healthcare provider.';
+        symptomDesc = '⚠️ You\'ve logged quite a few PCOS-related symptoms.\n\n'
+            '• Symptom episodes: $pcosSpecificCount in the last 30 days\n'
+            '${symptomsList.isNotEmpty ? '• Including: $symptomsList\n' : ''}\n'
+            'This pattern could indicate hormonal imbalances. It might be worth discussing with a doctor, '
+            'especially if these symptoms are affecting your daily life. Remember - having symptoms doesn\'t mean you definitely have PCOS, '
+            'but tracking helps you and your doctor understand what\'s happening.';
       } else if (pcosSpecificCount >= 6) {
         symptomSeverity = 'Moderate';
-        symptomDesc = 'Regular PCOS-related symptoms observed ($pcosSpecificCount episodes). These patterns indicate moderate hormonal irregularity. Tracking and lifestyle modifications recommended.';
+        symptomDesc = '📊 You\'re experiencing some PCOS-related symptoms.\n\n'
+            '• Symptom episodes: $pcosSpecificCount in the last 30 days\n'
+            '${symptomsList.isNotEmpty ? '• Including: $symptomsList\n' : ''}\n'
+            'This is fairly common and may be influenced by stress, diet, or hormonal fluctuations. '
+            'Keep tracking your symptoms - patterns over time are more meaningful than individual days. '
+            'Lifestyle changes like better sleep and reduced stress often help!';
       } else if (pcosSpecificCount >= 1) {
         symptomSeverity = 'Low';
-        symptomDesc = 'Some PCOS-related symptoms detected ($pcosSpecificCount episodes). Continue monitoring and logging for better patterns.';
+        symptomDesc = '✅ You\'ve had a few symptoms, but nothing concerning.\n\n'
+            '• Symptom episodes: $pcosSpecificCount in the last 30 days\n'
+            '${symptomsList.isNotEmpty ? '• Including: $symptomsList\n' : ''}\n'
+            'Occasional symptoms are completely normal. Keep logging to build a clearer picture of your health patterns.';
       } else {
-        symptomDesc = 'No significant PCOS-related symptoms detected yet.';
+        symptomDesc = '✅ Great news! No significant PCOS-related symptoms detected yet.\n\n'
+            'Keep logging any symptoms you experience - even mild ones. This helps build a complete picture of your health over time.';
       }
 
       factors.add({
@@ -1206,13 +1392,23 @@ class _LoginScreenState extends State<LoginScreen> {
                           ),
                           onPressed: _isLoading ? null : _handleLogin,
                           child: _isLoading
-                              ? const SizedBox(
-                                  height: 20,
-                                  width: 20,
-                                  child: CircularProgressIndicator(
-                                    color: Colors.white,
-                                    strokeWidth: 2,
-                                  ),
+                              ? Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    SizedBox(
+                                      height: 18,
+                                      width: 18,
+                                      child: CircularProgressIndicator(
+                                        color: Colors.white,
+                                        strokeWidth: 2.5,
+                                        valueColor: AlwaysStoppedAnimation<Color>(
+                                          Colors.white.withOpacity(0.9),
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    const Text('Signing In...', style: TextStyle(fontSize: 16)),
+                                  ],
                                 )
                               : const Text(
                                   'Sign In',
@@ -1296,6 +1492,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     ],
                   ),
                 ),
+                
               ],
             ),
           ),
@@ -1352,18 +1549,13 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   void _showForgotPasswordDialog() {
-    showDialog(
+    DialogHelper.showInfoDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Forgot Password'),
-        content: const Text('For demo purposes, use the provided demo accounts. In a real app, password reset functionality would be implemented here.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('OK'),
-          ),
-        ],
-      ),
+      title: 'Forgot Password',
+      message: 'For demo purposes, use the provided demo accounts. In a real app, password reset functionality would be implemented here.',
+      buttonText: 'OK',
+      icon: Icons.lock_reset_rounded,
+      iconColor: Colors.orange[400],
     );
   }
 }
@@ -1385,6 +1577,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       const HealthTrackingScreen(),
       const RiskAssessmentScreen(),
       const EducationScreen(),
+      const ExerciseRecipeTutorialsScreen(),
       const CommunityForumScreen(),
       const DoctorDirectoryScreen(),
       const DataReportingScreen(),
@@ -1446,9 +1639,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   _buildNavItem(Icons.favorite_outline, Icons.favorite, 'Health', 1, Colors.redAccent),
                   _buildNavItem(Icons.warning_amber_outlined, Icons.warning_amber, 'Risk', 2, Colors.orange),
                   _buildNavItem(Icons.school_outlined, Icons.school, 'Learn', 3, Colors.blue),
-                  _buildNavItem(Icons.chat_bubble_outline, Icons.chat_bubble, 'Forum', 4, Colors.purple),
-                  _buildNavItem(Icons.local_hospital_outlined, Icons.local_hospital, 'Doctors', 5, Colors.teal),
-                  _buildNavItem(Icons.assessment_outlined, Icons.assessment, 'Reports', 6, Colors.indigo),
+                  _buildNavItem(Icons.fitness_center_outlined, Icons.fitness_center, 'Workout', 4, Colors.green),
+                  _buildNavItem(Icons.chat_bubble_outline, Icons.chat_bubble, 'Forum', 5, Colors.purple),
+                  _buildNavItem(Icons.local_hospital_outlined, Icons.local_hospital, 'Doctors', 6, Colors.teal),
+                  _buildNavItem(Icons.assessment_outlined, Icons.assessment, 'Reports', 7, Colors.indigo),
                 ],
               ),
             ),
@@ -2368,13 +2562,23 @@ class _SignUpScreenState extends State<SignUpScreen> {
                             ),
                             onPressed: (_isLoading || !_agreeToTerms) ? null : _handleSignUp,
                             child: _isLoading
-                                ? const SizedBox(
-                                    height: 20,
-                                    width: 20,
-                                    child: CircularProgressIndicator(
-                                      color: Colors.white,
-                                      strokeWidth: 2,
-                                    ),
+                                ? Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      SizedBox(
+                                        height: 18,
+                                        width: 18,
+                                        child: CircularProgressIndicator(
+                                          color: Colors.white,
+                                          strokeWidth: 2.5,
+                                          valueColor: AlwaysStoppedAnimation<Color>(
+                                            Colors.white.withOpacity(0.9),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 10),
+                                      const Text('Creating Account...', style: TextStyle(fontSize: 16)),
+                                    ],
                                   )
                                 : const Text(
                                     'Create Account',
@@ -2711,30 +2915,20 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   ),
                   padding: const EdgeInsets.symmetric(vertical: 16),
                 ),
-                onPressed: () {
-                  showDialog(
+                onPressed: () async {
+                  final confirmed = await DialogHelper.showConfirmationDialog(
                     context: context,
-                    builder: (ctx) => AlertDialog(
-                      title: const Text('Logout'),
-                      content: const Text('Are you sure you want to logout?'),
-                      actions: [
-                        TextButton(
-                          onPressed: () => Navigator.pop(ctx),
-                          child: const Text('Cancel'),
-                        ),
-                        ElevatedButton(
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.red[400],
-                          ),
-                          onPressed: () {
-                            auth.logout();
-                            Navigator.of(context).popUntil((route) => route.isFirst);
-                          },
-                          child: const Text('Logout', style: TextStyle(color: Colors.white)),
-                        ),
-                      ],
-                    ),
+                    title: 'Logout',
+                    message: 'Are you sure you want to logout? You\'ll need to sign in again to access your data.',
+                    confirmText: 'Logout',
+                    cancelText: 'Cancel',
+                    icon: Icons.logout_rounded,
+                    isDangerous: true,
                   );
+                  if (confirmed == true) {
+                    auth.logout();
+                    Navigator.of(context).popUntil((route) => route.isFirst);
+                  }
                 },
                 child: const Text(
                   'Logout',
@@ -2852,66 +3046,46 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   void _showChangePasswordDialog() {
-    showDialog(
+    DialogHelper.showInfoDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Change Password'),
-        content: const Text('Password change functionality would be implemented here.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Close'),
-          ),
-        ],
-      ),
+      title: 'Change Password',
+      message: 'Password change functionality would be implemented here.',
+      buttonText: 'Close',
+      icon: Icons.password_rounded,
+      iconColor: Colors.blue[400],
     );
   }
 
   void _showNotificationSettings() {
-    showDialog(
+    DialogHelper.showInfoDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Notification Settings'),
-        content: const Text('Notification preferences would be configured here.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Close'),
-          ),
-        ],
-      ),
+      title: 'Notification Settings',
+      message: 'Notification preferences would be configured here.',
+      buttonText: 'Close',
+      icon: Icons.notifications_rounded,
+      iconColor: Colors.amber[500],
     );
   }
 
   void _showPrivacySettings() {
-    showDialog(
+    DialogHelper.showInfoDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Privacy Settings'),
-        content: const Text('Privacy controls would be available here.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Close'),
-          ),
-        ],
-      ),
+      title: 'Privacy Settings',
+      message: 'Privacy controls would be available here.',
+      buttonText: 'Close',
+      icon: Icons.privacy_tip_rounded,
+      iconColor: Colors.teal[400],
     );
   }
 
   void _showHelpDialog() {
-    showDialog(
+    DialogHelper.showInfoDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Help & Support'),
-        content: const Text('Contact: support@ovacare.com\nPhone: +63-45-625-HELP'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Close'),
-          ),
-        ],
-      ),
+      title: 'Help & Support',
+      message: 'Contact: support@ovacare.com\nPhone: +63-45-625-HELP',
+      buttonText: 'Close',
+      icon: Icons.support_agent_rounded,
+      iconColor: Colors.green[400],
     );
   }
 }
@@ -3077,6 +3251,49 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
           
           // Calendar widget (priority - shown second)
           _buildFloStyleCalendar(health),
+          const SizedBox(height: 16),
+          
+          // Clear button for old data
+          if (health.menstrualCycles.isNotEmpty)
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: () async {
+                  final confirmed = await DialogHelper.showConfirmationDialog(
+                    context: context,
+                    title: 'Clear Cycle History?',
+                    message: 'This will delete all stored menstrual cycle data. This action cannot be undone.',
+                    confirmText: 'Clear All',
+                    cancelText: 'Cancel',
+                    icon: Icons.delete_forever_rounded,
+                    isDangerous: true,
+                  );
+                  if (confirmed == true) {
+                    health.clearCycleHistory();
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: const Row(
+                          children: [
+                            Icon(Icons.check_circle, color: Colors.white),
+                            SizedBox(width: 8),
+                            Text('Cycle history cleared'),
+                          ],
+                        ),
+                        backgroundColor: Colors.green[600],
+                        behavior: SnackBarBehavior.floating,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                      ),
+                    );
+                  }
+                },
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('Clear Cycle History'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red[50],
+                  foregroundColor: Colors.red[400],
+                ),
+              ),
+            ),
           const SizedBox(height: 16),
           
           // Today's insights (Flo-style)
@@ -4350,12 +4567,78 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
               fontSize: 14,
             ),
           ),
+          // Add prediction card if we can predict
+          if (health.menstrualCycles.length >= 2)
+            Padding(
+              padding: const EdgeInsets.only(top: 16),
+              child: _buildNextPeriodPredictionBadge(health),
+            ),
         ],
       ),
     );
   }
 
-  // Today's insights card (Flo-style)
+  // Prediction badge to show in cycle overview card
+  Widget _buildNextPeriodPredictionBadge(HealthDataProvider health) {
+    final nextPeriod = health.getNextPeriodPrediction();
+    final daysUntil = health.getDaysUntilNextPeriod();
+    
+    if (nextPeriod == null || daysUntil == null) {
+      return const SizedBox.shrink();
+    }
+
+    final monthNames = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    final dateStr = '${nextPeriod.day} ${monthNames[nextPeriod.month]}';
+    
+    String label;
+    if (daysUntil < 0) {
+      label = 'Overdue by ${daysUntil.abs()} day${daysUntil.abs() == 1 ? '' : 's'}';
+    } else if (daysUntil == 0) {
+      label = 'Expected today';
+    } else {
+      label = 'in $daysUntil day${daysUntil == 1 ? '' : 's'}';
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white.withOpacity(0.3), width: 1),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.calendar_today, color: Colors.white.withOpacity(0.8), size: 16),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Next period predicted',
+                  style: TextStyle(
+                    color: Colors.white.withOpacity(0.8),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                Text(
+                  '$dateStr ($label)',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildTodayInsightsCard(HealthDataProvider health) {
     final today = DateTime.now();
     // Use only actual period marking to tailor insights
@@ -5219,89 +5502,85 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
   }
 
   void _logMood(HealthDataProvider health) async {
-    String selectedMood = 'Happy';
     const moods = ['Happy', 'Sad', 'Anxious', 'Energetic', 'Tired', 'Irritable', 'Calm', 'Stressed'];
-    
-    await showDialog(
+    const moodIcons = {
+      'Happy': Icons.sentiment_very_satisfied_rounded,
+      'Sad': Icons.sentiment_dissatisfied_rounded,
+      'Anxious': Icons.psychology_rounded,
+      'Energetic': Icons.bolt_rounded,
+      'Tired': Icons.bedtime_rounded,
+      'Irritable': Icons.sentiment_very_dissatisfied_rounded,
+      'Calm': Icons.spa_rounded,
+      'Stressed': Icons.warning_rounded,
+    };
+
+    final selectedMood = await DialogHelper.showSelectionDialog<String>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('How are you feeling?'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: moods.map((mood) => ListTile(
-            title: Text(mood),
-            leading: Radio<String>(
-              value: mood,
-              groupValue: selectedMood,
-              onChanged: (value) => selectedMood = value!,
-            ),
-          )).toList(),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              health.addSymptom({
-                'date': DateTime.now(),
-                'mood': selectedMood,
-                'cramps': 0,
-                'acne': false,
-                'bloating': false,
-              });
-              Navigator.pop(ctx);
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Mood logged successfully!')),
-              );
-            },
-            child: const Text('Log'),
-          ),
-        ],
-      ),
+      title: 'How are you feeling?',
+      subtitle: 'Select your current mood',
+      icon: Icons.mood_rounded,
+      iconColor: Colors.amber[500],
+      options: moods.map((mood) => SelectionOption(
+        value: mood,
+        label: mood,
+        icon: moodIcons[mood],
+      )).toList(),
     );
+
+    if (selectedMood != null) {
+      health.addSymptom({
+        'date': DateTime.now(),
+        'mood': selectedMood,
+        'cramps': 0,
+        'acne': false,
+        'bloating': false,
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              const Icon(Icons.check_circle, color: Colors.white),
+              const SizedBox(width: 8),
+              Text('Mood logged: $selectedMood'),
+            ],
+          ),
+          backgroundColor: Colors.green[600],
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        ),
+      );
+    }
   }
 
   void _logIntimacy(HealthDataProvider health) async {
-    bool protected = false;
-    
-    await showDialog(
+    final confirmed = await DialogHelper.showConfirmationDialog(
       context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: const Text('Log Intimacy'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
+      title: 'Log Intimacy',
+      message: 'Track intimate moments for better cycle insights and fertility tracking.',
+      confirmText: 'Log',
+      cancelText: 'Cancel',
+      icon: Icons.favorite_rounded,
+      iconColor: Colors.red[400],
+      confirmColor: Colors.pink[500],
+    );
+
+    if (confirmed == true) {
+      // Add to a new intimacy log (you'd need to add this to HealthDataProvider)
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Row(
             children: [
-              const Text('Track intimate moments for better cycle insights'),
-              const SizedBox(height: 16),
-              CheckboxListTile(
-                title: const Text('Protected'),
-                value: protected,
-                onChanged: (value) => setDialogState(() => protected = value!),
-              ),
+              Icon(Icons.check_circle, color: Colors.white),
+              SizedBox(width: 8),
+              Text('Intimacy logged successfully!'),
             ],
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                // Add to a new intimacy log (you'd need to add this to HealthDataProvider)
-                Navigator.pop(ctx);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Intimacy logged successfully!')),
-                );
-              },
-              child: const Text('Log'),
-            ),
-          ],
+          backgroundColor: Colors.pink[600],
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
         ),
-      ),
-    );
+      );
+    }
   }
 
   void _logWeight(HealthDataProvider health) {
@@ -5310,41 +5589,35 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
   }
 
   void _logNotes(HealthDataProvider health) async {
-    final controller = TextEditingController();
-    
-    await showDialog(
+    final result = await DialogHelper.showInputDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Add Notes'),
-        content: TextField(
-          controller: controller,
-          decoration: const InputDecoration(
-            labelText: 'Notes',
-            hintText: 'How are you feeling today?',
-            border: OutlineInputBorder(),
-          ),
-          maxLines: 4,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              if (controller.text.isNotEmpty) {
-                // Add notes functionality to HealthDataProvider
-                Navigator.pop(ctx);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Notes saved successfully!')),
-                );
-              }
-            },
-            child: const Text('Save'),
-          ),
-        ],
-      ),
+      title: 'Add Notes',
+      subtitle: 'Record how you\'re feeling today',
+      hintText: 'How are you feeling today?',
+      confirmText: 'Save',
+      cancelText: 'Cancel',
+      icon: Icons.edit_note_rounded,
+      iconColor: Colors.purple[400],
+      maxLines: 4,
     );
+
+    if (result != null && result.isNotEmpty) {
+      // Add notes functionality to HealthDataProvider
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Row(
+            children: [
+              Icon(Icons.check_circle, color: Colors.white),
+              SizedBox(width: 8),
+              Text('Notes saved successfully!'),
+            ],
+          ),
+          backgroundColor: Colors.green[600],
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        ),
+      );
+    }
   }
 
   void _showDayDetail(DateTime date, HealthDataProvider health) {
@@ -6628,6 +6901,1177 @@ class EducationScreen extends StatelessWidget {
           ),
         );
       }).toList(),
+    );
+  }
+}
+
+// Exercise and Recipe Tutorials Screen
+class ExerciseRecipeTutorialsScreen extends StatefulWidget {
+  const ExerciseRecipeTutorialsScreen({super.key});
+
+  @override
+  State<ExerciseRecipeTutorialsScreen> createState() => _ExerciseRecipeTutorialsScreenState();
+}
+
+class _ExerciseRecipeTutorialsScreenState extends State<ExerciseRecipeTutorialsScreen> with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+  int _selectedDifficulty = 0;
+
+  final List<Map<String, dynamic>> exercises = [
+    {
+      'title': 'Low-Impact Cardio Workout',
+      'duration': '20 mins',
+      'difficulty': 'Beginner',
+      'difficulty_level': 1,
+      'description': 'Perfect for beginners. Gentle cardio exercise to improve heart health and burn calories.',
+      'steps': [
+        'Warm up: 3 minutes of light walking',
+        'Marching in place: 5 minutes',
+        'Side steps: 4 minutes',
+        'Cool down: 3 minutes of slow walking',
+        'Stretching: 5 minutes'
+      ],
+      'benefits': ['Improved cardiovascular health', 'Weight management', 'Increased energy'],
+      'icon': Icons.directions_walk,
+      'color': Colors.green,
+      'videoUrl': 'https://www.youtube.com/watch?v=Ck1pvGQ8_nQ',
+    },
+    {
+      'title': 'Yoga for PCOS',
+      'duration': '30 mins',
+      'difficulty': 'Beginner',
+      'difficulty_level': 1,
+      'description': 'Gentle yoga poses specifically designed to help with PCOS symptoms and stress relief.',
+      'steps': [
+        'Child\'s pose: 2 minutes',
+        'Cat-cow stretch: 3 minutes',
+        'Cobra pose: 2 minutes',
+        'Warrior pose series: 10 minutes',
+        'Pigeon pose: 5 minutes',
+        'Savasana (relaxation): 8 minutes'
+      ],
+      'benefits': ['Stress reduction', 'Improved flexibility', 'Better hormone balance'],
+      'icon': Icons.self_improvement,
+      'color': Colors.purple,
+      'videoUrl': 'https://www.youtube.com/watch?v=9K8SZpdMkOQ',
+    },
+    {
+      'title': 'Strength Training Basics',
+      'duration': '25 mins',
+      'difficulty': 'Intermediate',
+      'difficulty_level': 2,
+      'description': 'Build muscle and improve metabolism with these essential strength training exercises.',
+      'steps': [
+        'Warm-up: 5 minutes light cardio',
+        'Squats: 3 sets of 10 reps',
+        'Push-ups: 3 sets of 8 reps',
+        'Lunges: 3 sets of 10 reps each leg',
+        'Plank hold: 3 sets of 30 seconds',
+        'Cool down and stretch: 5 minutes'
+      ],
+      'benefits': ['Increased muscle strength', 'Better insulin sensitivity', 'Improved posture'],
+      'icon': Icons.fitness_center,
+      'color': Colors.orange,
+      'videoUrl': 'https://www.youtube.com/watch?v=U0bhE67HuDY',
+    },
+    {
+      'title': 'HIIT Workout for Weight Loss',
+      'duration': '20 mins',
+      'difficulty': 'Advanced',
+      'difficulty_level': 3,
+      'description': 'High-Intensity Interval Training to maximize calorie burn and improve fitness.',
+      'steps': [
+        'Warm up: 3 minutes',
+        'Burpees: 30 seconds on, 30 seconds rest (5 rounds)',
+        'Mountain climbers: 30 seconds on, 30 seconds rest (5 rounds)',
+        'Jump squats: 30 seconds on, 30 seconds rest (5 rounds)',
+        'Cool down: 5 minutes'
+      ],
+      'benefits': ['Rapid calorie burn', 'Improved cardiovascular fitness', 'Time-efficient workout'],
+      'icon': Icons.flash_on,
+      'color': Colors.red,
+      'videoUrl': 'https://www.youtube.com/watch?v=ml6cT4AZdqI',
+    },
+  ];
+
+  final List<Map<String, dynamic>> recipes = [
+    {
+      'title': 'Quinoa Buddha Bowl',
+      'prepTime': '15 mins',
+      'cookTime': '20 mins',
+      'servings': 2,
+      'difficulty': 'Easy',
+      'difficulty_level': 1,
+      'description': 'A nutrient-rich bowl packed with protein, fiber, and healthy fats. Perfect for PCOS management.',
+      'ingredients': [
+        '1 cup quinoa',
+        '2 cups mixed vegetables (broccoli, bell peppers, carrots)',
+        '1 avocado, sliced',
+        '1 can chickpeas, roasted',
+        '2 tbsp olive oil',
+        'Salt and pepper to taste',
+        'Lemon juice'
+      ],
+      'instructions': [
+        'Cook quinoa according to package directions',
+        'Roast vegetables at 400°F for 20 minutes',
+        'Toast chickpeas with spices for 15 minutes',
+        'Arrange quinoa in bowls',
+        'Top with roasted vegetables, chickpeas, and avocado',
+        'Drizzle with olive oil and lemon juice',
+        'Serve and enjoy!'
+      ],
+      'benefits': ['High in protein', 'Low glycemic index', 'Rich in fiber'],
+      'icon': Icons.restaurant,
+      'color': Colors.green,
+      'videoUrl': 'https://www.youtube.com/watch?v=AlSvyLG1etI&t=44s',
+    },
+    {
+      'title': 'Grilled Chicken with Sweet Potato',
+      'prepTime': '10 mins',
+      'cookTime': '25 mins',
+      'servings': 1,
+      'difficulty': 'Easy',
+      'difficulty_level': 1,
+      'description': 'Lean protein with complex carbs. A balanced meal that helps regulate insulin levels.',
+      'ingredients': [
+        '150g chicken breast',
+        '1 medium sweet potato',
+        '1 cup broccoli',
+        '1 tbsp olive oil',
+        'Herbs: thyme, rosemary',
+        'Salt and pepper'
+      ],
+      'instructions': [
+        'Preheat grill to medium-high heat',
+        'Cube sweet potato and boil until tender (15 mins)',
+        'Season chicken breast with herbs, salt, and pepper',
+        'Grill chicken for 12-15 minutes until cooked through',
+        'Steam or roast broccoli for 10 minutes',
+        'Combine all components on a plate',
+        'Drizzle with olive oil and serve'
+      ],
+      'benefits': ['Complete protein', 'Helps with weight management', 'Nutrient-dense'],
+      'icon': Icons.restaurant,
+      'color': Colors.amber,
+      'videoUrl': 'https://www.youtube.com/watch?v=EjjKRqQYQPw',
+    },
+    {
+      'title': 'Green Smoothie Bowl',
+      'prepTime': '5 mins',
+      'cookTime': '0 mins',
+      'servings': 1,
+      'difficulty': 'Easy',
+      'difficulty_level': 1,
+      'description': 'Quick and delicious breakfast packed with vitamins and minerals.',
+      'ingredients': [
+        '1 cup spinach',
+        '1 banana',
+        '1 cup unsweetened almond milk',
+        '1 tbsp almond butter',
+        'Toppings: granola, berries, coconut flakes',
+        'Ice cubes'
+      ],
+      'instructions': [
+        'Add spinach, banana, almond milk, almond butter, and ice to blender',
+        'Blend until smooth',
+        'Pour into a bowl',
+        'Top with granola, fresh berries, and coconut flakes',
+        'Enjoy immediately'
+      ],
+      'benefits': ['Quick breakfast option', 'Packed with antioxidants', 'Sustained energy'],
+      'icon': Icons.local_drink,
+      'color': Colors.lightGreen,
+      'videoUrl': 'https://www.youtube.com/watch?v=q5-r7RpOooU',
+    },
+    {
+      'title': 'Baked Salmon with Vegetables',
+      'prepTime': '10 mins',
+      'cookTime': '20 mins',
+      'servings': 2,
+      'difficulty': 'Intermediate',
+      'difficulty_level': 2,
+      'description': 'Omega-3 rich salmon with roasted vegetables for hormonal balance.',
+      'ingredients': [
+        '2 salmon fillets (150g each)',
+        '2 cups mixed vegetables (zucchini, asparagus, bell pepper)',
+        '2 tbsp olive oil',
+        '2 cloves garlic, minced',
+        'Lemon slices',
+        'Herbs: dill, basil'
+      ],
+      'instructions': [
+        'Preheat oven to 400°F',
+        'Line baking sheet with parchment paper',
+        'Place salmon on sheet, season with dill and salt',
+        'Arrange vegetables around salmon',
+        'Drizzle with olive oil and scatter garlic',
+        'Bake for 20 minutes until salmon is cooked',
+        'Serve with lemon wedges'
+      ],
+      'benefits': ['Omega-3 fatty acids', 'Reduces inflammation', 'Supports hormone health'],
+      'icon': Icons.restaurant,
+      'color': Colors.orange,
+      'videoUrl': 'https://www.youtube.com/watch?v=iHNGJHaEKmE',
+    },
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final auth = context.watch<AuthProvider>();
+    final health = context.watch<HealthDataProvider>();
+
+    return Column(
+      children: [
+        // Header with personalization info
+        Container(
+          color: Colors.pink[50],
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Personalized Workouts & Recipes',
+                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                  fontWeight: FontWeight.bold,
+                  color: Colors.pink[800],
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Based on your health data and preferences',
+                style: TextStyle(fontSize: 14, color: Colors.grey[700]),
+              ),
+            ],
+          ),
+        ),
+        // Tab Bar
+        TabBar(
+          controller: _tabController,
+          labelColor: Colors.pink,
+          unselectedLabelColor: Colors.grey[600],
+          indicatorColor: Colors.pink,
+          tabs: const [
+            Tab(icon: Icon(Icons.fitness_center), text: 'Exercises'),
+            Tab(icon: Icon(Icons.restaurant), text: 'Recipes'),
+          ],
+        ),
+        // Tab Content
+        Expanded(
+          child: TabBarView(
+            controller: _tabController,
+            children: [
+              // Exercises Tab
+              _buildExercisesView(),
+              // Recipes Tab
+              _buildRecipesView(),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildExercisesView() {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        // Difficulty Filter
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            children: [
+              const Text('Difficulty: ', style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(width: 8),
+              ...[
+                ('All', -1),
+                ('Beginner', 1),
+                ('Intermediate', 2),
+                ('Advanced', 3),
+              ].map((item) {
+                final isSelected = _selectedDifficulty == item.$2;
+                return Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: FilterChip(
+                    label: Text(item.$1),
+                    selected: isSelected,
+                    backgroundColor: Colors.grey[200],
+                    selectedColor: Colors.green[300],
+                    onSelected: (selected) {
+                      setState(() => _selectedDifficulty = item.$2);
+                    },
+                  ),
+                );
+              }).toList(),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        // Exercise Cards
+        ...exercises
+            .where((ex) => _selectedDifficulty == -1 || ex['difficulty_level'] == _selectedDifficulty)
+            .map((exercise) => _buildExerciseCard(exercise))
+            .toList(),
+      ],
+    );
+  }
+
+  Widget _buildExerciseCard(Map<String, dynamic> exercise) {
+    return Card(
+      elevation: 3,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      margin: const EdgeInsets.only(bottom: 16),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: () => _showExerciseDetails(exercise),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: (exercise['color'] as Color).withOpacity(0.2),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Icon(
+                      exercise['icon'] as IconData,
+                      color: exercise['color'] as Color,
+                      size: 28,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          exercise['title'] as String,
+                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          exercise['description'] as String,
+                          style: TextStyle(fontSize: 13, color: Colors.grey[700]),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Chip(
+                    label: Text(exercise['duration'] as String),
+                    backgroundColor: Colors.blue[50],
+                    avatar: Icon(Icons.timer_outlined, size: 16, color: Colors.blue[700]),
+                  ),
+                  const SizedBox(width: 8),
+                  Chip(
+                    label: Text(exercise['difficulty'] as String),
+                    backgroundColor: (exercise['color'] as Color).withOpacity(0.2),
+                    labelStyle: TextStyle(color: exercise['color'] as Color),
+                  ),
+                  const Spacer(),
+                  Icon(Icons.play_circle_outlined, color: Colors.pink, size: 24),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRecipesView() {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: recipes
+          .map((recipe) => _buildRecipeCard(recipe))
+          .toList(),
+    );
+  }
+
+  Widget _buildRecipeCard(Map<String, dynamic> recipe) {
+    return Card(
+      elevation: 3,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      margin: const EdgeInsets.only(bottom: 16),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: () => _showRecipeDetails(recipe),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: (recipe['color'] as Color).withOpacity(0.2),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Icon(
+                      recipe['icon'] as IconData,
+                      color: recipe['color'] as Color,
+                      size: 28,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          recipe['title'] as String,
+                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          recipe['description'] as String,
+                          style: TextStyle(fontSize: 13, color: Colors.grey[700]),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Chip(
+                    label: Text('${recipe['prepTime']} prep'),
+                    backgroundColor: Colors.amber[50],
+                    avatar: Icon(Icons.schedule_outlined, size: 16, color: Colors.amber[700]),
+                  ),
+                  const SizedBox(width: 8),
+                  Chip(
+                    label: Text('${recipe['servings']} servings'),
+                    backgroundColor: Colors.orange[50],
+                    avatar: Icon(Icons.people_outline, size: 16, color: Colors.orange[700]),
+                  ),
+                  const Spacer(),
+                  Icon(Icons.info_outline, color: Colors.pink, size: 24),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showExerciseDetails(Map<String, dynamic> exercise) {
+    final videoUrl = exercise['videoUrl'] as String;
+    final videoId = _extractVideoId(videoUrl);
+    
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => _ExerciseDetailsSheet(
+        exercise: exercise,
+        videoId: videoId,
+        videoUrl: videoUrl,
+      ),
+    );
+  }
+
+  void _showRecipeDetails(Map<String, dynamic> recipe) {
+    final videoUrl = recipe['videoUrl'] as String;
+    final videoId = _extractVideoId(videoUrl);
+    
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => _RecipeDetailsSheet(
+        recipe: recipe,
+        videoId: videoId,
+        videoUrl: videoUrl,
+      ),
+    );
+  }
+
+  String _extractVideoId(String url) {
+    try {
+      print('DEBUG: Attempting to extract video ID from URL: $url');
+      
+      // Method 1: youtu.be short format
+      if (url.contains('youtu.be/')) {
+        final match = RegExp(r'youtu\.be/([a-zA-Z0-9_-]{11})').firstMatch(url);
+        if (match != null && match.group(1) != null) {
+          final id = match.group(1)!;
+          print('DEBUG: Extracted from youtu.be format: $id');
+          return id;
+        }
+      }
+      
+      // Method 2: youtube.com/watch?v= format
+      if (url.contains('youtube.com/watch') || url.contains('youtube.com/embed')) {
+        final match = RegExp(r'[?&]v=([a-zA-Z0-9_-]{11})').firstMatch(url);
+        if (match != null && match.group(1) != null) {
+          final id = match.group(1)!;
+          print('DEBUG: Extracted from youtube.com format: $id');
+          return id;
+        }
+      }
+      
+      // Method 3: youtube.com/embed/ format
+      if (url.contains('youtube.com/embed/')) {
+        final match = RegExp(r'embed/([a-zA-Z0-9_-]{11})').firstMatch(url);
+        if (match != null && match.group(1) != null) {
+          final id = match.group(1)!;
+          print('DEBUG: Extracted from embed format: $id');
+          return id;
+        }
+      }
+      
+      print('DEBUG: No regex match found for URL format');
+    } catch (e) {
+      print('ERROR extracting video ID: $e');
+      print('ERROR stack trace: $e');
+    }
+    print('DEBUG: Returning empty video ID');
+    return '';
+  }
+
+  Widget _buildInfoPill(IconData icon, String value, String label) {
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Colors.blue[50],
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Icon(icon, color: Colors.blue[700]),
+        ),
+        const SizedBox(height: 8),
+        Text(value, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+        Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+      ],
+    );
+  }
+
+  Future<void> _launchUrl(String urlString) async {
+    final Uri url = Uri.parse(urlString);
+    if (await canLaunchUrl(url)) {
+      await launchUrl(
+        url,
+        mode: LaunchMode.externalApplication,
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not launch $urlString')),
+      );
+    }
+  }
+}
+
+// Exercise Details Sheet with embedded video player
+class _ExerciseDetailsSheet extends StatefulWidget {
+  final Map<String, dynamic> exercise;
+  final String videoId;
+  final String videoUrl;
+
+  const _ExerciseDetailsSheet({
+    required this.exercise,
+    required this.videoId,
+    required this.videoUrl,
+  });
+
+  @override
+  State<_ExerciseDetailsSheet> createState() => _ExerciseDetailsSheetState();
+}
+
+class _ExerciseDetailsSheetState extends State<_ExerciseDetailsSheet> {
+  @override
+  void initState() {
+    super.initState();
+  }
+
+  @override
+  void dispose() {
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DraggableScrollableSheet(
+      initialChildSize: 0.9,
+      minChildSize: 0.5,
+      maxChildSize: 0.95,
+      builder: (_, scrollController) => Container(
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.only(
+            topLeft: Radius.circular(20),
+            topRight: Radius.circular(20),
+          ),
+        ),
+        child: SingleChildScrollView(
+          controller: scrollController,
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Watch Video Button
+                Container(
+                  margin: const EdgeInsets.only(bottom: 20),
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(12),
+                    color: Colors.pink[50],
+                    border: Border.all(color: Colors.pink[200]!, width: 2),
+                  ),
+                  child: Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      onTap: () => _launchYoutubeVideo(widget.videoUrl),
+                      borderRadius: BorderRadius.circular(12),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 40, horizontal: 20),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(Icons.play_circle_filled, size: 64, color: Colors.pink),
+                            const SizedBox(height: 12),
+                            Text(
+                              'Watch Video on YouTube',
+                              style: TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.pink[800],
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              'Tap to open in YouTube',
+                              style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                // Title and Description
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: (widget.exercise['color'] as Color).withOpacity(0.2),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Icon(
+                        widget.exercise['icon'] as IconData,
+                        color: widget.exercise['color'] as Color,
+                        size: 32,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            widget.exercise['title'] as String,
+                            style: const TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            widget.exercise['description'] as String,
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: Colors.grey[700],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 20),
+                // Duration and Difficulty
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceAround,
+                  children: [
+                    _buildInfoPill(
+                      Icons.timer_outlined,
+                      widget.exercise['duration'] as String,
+                      'Duration',
+                    ),
+                    _buildInfoPill(
+                      Icons.trending_up,
+                      widget.exercise['difficulty'] as String,
+                      'Level',
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 24),
+                // Workout Steps
+                Text(
+                  'Workout Steps',
+                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                ...(widget.exercise['steps'] as List<String>)
+                    .asMap()
+                    .entries
+                    .map((entry) => Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Container(
+                            width: 32,
+                            height: 32,
+                            decoration: BoxDecoration(
+                              color: (widget.exercise['color'] as Color)
+                                  .withOpacity(0.2),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Center(
+                              child: Text(
+                                '${entry.key + 1}',
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              entry.value,
+                              style: const TextStyle(
+                                fontSize: 14,
+                                height: 1.5,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ))
+                    .toList(),
+                const SizedBox(height: 24),
+                // Benefits
+                Text(
+                  'Benefits',
+                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                ...(widget.exercise['benefits'] as List<String>)
+                    .map((benefit) => Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.check_circle,
+                            color: Colors.green[600],
+                            size: 20,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              benefit,
+                              style: const TextStyle(fontSize: 14),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ))
+                    .toList(),
+                const SizedBox(height: 24),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInfoPill(IconData icon, String value, String label) {
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Colors.blue[50],
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Icon(icon, color: Colors.blue[700]),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          value,
+          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+        ),
+        Text(
+          label,
+          style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _launchYoutubeVideo(String url) async {
+    try {
+      final Uri videoUrl = Uri.parse(url);
+      if (await canLaunchUrl(videoUrl)) {
+        await launchUrl(videoUrl, mode: LaunchMode.externalApplication);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not open video')),
+        );
+      }
+    } catch (e) {
+      print('Error launching video: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Error opening video')),
+      );
+    }
+  }
+}
+
+// Recipe Details Sheet with embedded video player
+class _RecipeDetailsSheet extends StatefulWidget {
+  final Map<String, dynamic> recipe;
+  final String videoId;
+  final String videoUrl;
+
+  const _RecipeDetailsSheet({
+    required this.recipe,
+    required this.videoId,
+    required this.videoUrl,
+  });
+
+  @override
+  State<_RecipeDetailsSheet> createState() => _RecipeDetailsSheetState();
+}
+
+class _RecipeDetailsSheetState extends State<_RecipeDetailsSheet> {
+  @override
+  void initState() {
+    super.initState();
+  }
+
+  @override
+  void dispose() {
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DraggableScrollableSheet(
+      initialChildSize: 0.9,
+      minChildSize: 0.5,
+      maxChildSize: 0.95,
+      builder: (_, scrollController) => Container(
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.only(
+            topLeft: Radius.circular(20),
+            topRight: Radius.circular(20),
+          ),
+        ),
+        child: SingleChildScrollView(
+          controller: scrollController,
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Watch Video Button
+                Container(
+                  margin: const EdgeInsets.only(bottom: 20),
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(12),
+                    color: Colors.orange[50],
+                    border: Border.all(color: Colors.orange[200]!, width: 2),
+                  ),
+                  child: Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      onTap: () => _launchYoutubeVideo(widget.videoUrl),
+                      borderRadius: BorderRadius.circular(12),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 40, horizontal: 20),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(Icons.play_circle_filled, size: 64, color: Colors.orange),
+                            const SizedBox(height: 12),
+                            Text(
+                              'Watch Recipe Video on YouTube',
+                              style: TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.orange[800],
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              'Tap to open in YouTube',
+                              style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                // Title and Description
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: (widget.recipe['color'] as Color).withOpacity(0.2),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Icon(
+                        widget.recipe['icon'] as IconData,
+                        color: widget.recipe['color'] as Color,
+                        size: 32,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            widget.recipe['title'] as String,
+                            style: const TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            widget.recipe['description'] as String,
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: Colors.grey[700],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 20),
+                // Prep, Cook, Servings
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceAround,
+                  children: [
+                    _buildInfoPill(
+                      Icons.schedule_outlined,
+                      widget.recipe['prepTime'] as String,
+                      'Prep',
+                    ),
+                    _buildInfoPill(
+                      Icons.restaurant_outlined,
+                      widget.recipe['cookTime'] as String,
+                      'Cook',
+                    ),
+                    _buildInfoPill(
+                      Icons.people_outline,
+                      '${widget.recipe['servings']} servings',
+                      'Servings',
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 24),
+                // Ingredients
+                Text(
+                  'Ingredients',
+                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                ...(widget.recipe['ingredients'] as List<String>)
+                    .map((ingredient) => Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.check_circle,
+                            color: Colors.green[600],
+                            size: 20,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              ingredient,
+                              style: const TextStyle(fontSize: 14),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ))
+                    .toList(),
+                const SizedBox(height: 24),
+                // Instructions
+                Text(
+                  'Instructions',
+                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                ...(widget.recipe['instructions'] as List<String>)
+                    .asMap()
+                    .entries
+                    .map((entry) => Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Container(
+                            width: 32,
+                            height: 32,
+                            decoration: BoxDecoration(
+                              color: (widget.recipe['color'] as Color)
+                                  .withOpacity(0.2),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Center(
+                              child: Text(
+                                '${entry.key + 1}',
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              entry.value,
+                              style: const TextStyle(
+                                fontSize: 14,
+                                height: 1.5,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ))
+                    .toList(),
+                const SizedBox(height: 24),
+                // Health Benefits
+                Text(
+                  'Health Benefits',
+                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                ...(widget.recipe['benefits'] as List<String>)
+                    .map((benefit) => Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.favorite,
+                            color: Colors.red[400],
+                            size: 20,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              benefit,
+                              style: const TextStyle(fontSize: 14),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ))
+                    .toList(),
+                const SizedBox(height: 24),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _launchYoutubeVideo(String url) async {
+    try {
+      final Uri videoUrl = Uri.parse(url);
+      if (await canLaunchUrl(videoUrl)) {
+        await launchUrl(videoUrl, mode: LaunchMode.externalApplication);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not open video')),
+        );
+      }
+    } catch (e) {
+      print('Error launching video: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Error opening video')),
+      );
+    }
+  }
+
+  Widget _buildInfoPill(IconData icon, String value, String label) {
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Colors.orange[50],
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Icon(icon, color: Colors.orange[700]),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          value,
+          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+        ),
+        Text(
+          label,
+          style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+        ),
+      ],
     );
   }
 }

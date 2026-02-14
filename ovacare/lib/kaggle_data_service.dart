@@ -121,63 +121,99 @@ class KaggleDataService {
   static Future<List<Map<String, dynamic>>> searchKaggleDatasets(
       String query) async {
     try {
+      print('🔍 Searching Kaggle for: $query');
+      
+      // Build search URL - Kaggle API v1 datasets list endpoint
+      final searchUrl = Uri.parse(
+        '$kaggleApiUrl/datasets/list?search=$query&sort_by=hotness&max_size=20',
+      );
+
       final response = await http.get(
-        Uri.parse('$kaggleApiUrl/datasets/list?search=$query&sort_by=hotness'),
+        searchUrl,
         headers: {
           'Authorization': 'Basic $_basicAuth',
           'Content-Type': 'application/json',
         },
-      ).timeout(const Duration(seconds: 15));
+      ).timeout(const Duration(seconds: 30));
+
+      print('📡 Kaggle API Response Status: ${response.statusCode}');
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body);
-        return data
+        print('✅ Found ${data.length} datasets from Kaggle');
+        
+        final results = data
             .map((item) => {
                   'id': item['ref'] ?? 'unknown',
                   'title': item['title'] ?? 'Unknown',
-                  'description': item['subtitle'] ?? '',
-                  'source': 'Kaggle API',
+                  'description': item['subtitle'] ?? item['description'] ?? '',
+                  'source': 'Kaggle API (Live)',
                   'downloads': item['downloadCount'] ?? 0,
-                  'usability': item['usabilityRating'] ?? 0,
+                  'usability': item['usabilityRating'] ?? 0.0,
                   'owner': item['ownerName'] ?? 'Unknown',
+                  'url': 'https://www.kaggle.com/datasets/${item['ref']}',
+                  'size_bytes': item['datasetSizeBytes'] ?? 0,
+                  'last_updated': item['lastUpdated'] ?? 'Unknown',
+                  'is_featured': item['isFeatured'] ?? false,
                 })
             .toList();
+        
+        return results;
       } else if (response.statusCode == 401) {
-        print('Kaggle API authentication failed - using embedded data');
+        print('❌ Kaggle API authentication failed (401)');
+        return _getEmbeddedDatasets();
+      } else if (response.statusCode == 404) {
+        print('⚠️ No datasets found for query: $query');
+        return _getEmbeddedDatasets();
+      } else {
+        print('⚠️ Kaggle API error ${response.statusCode}: ${response.body}');
         return _getEmbeddedDatasets();
       }
     } catch (e) {
-      print('Kaggle API error: $e - falling back to embedded datasets');
+      print('❌ Kaggle API exception: $e - falling back to embedded datasets');
+      return _getEmbeddedDatasets();
     }
-
-    // Fallback to embedded datasets
-    return _getEmbeddedDatasets();
   }
 
   /// Get list of Kaggle datasets
   static Future<List<Map<String, dynamic>>> listKaggleDatasets() async {
     try {
+      print('📋 Fetching Kaggle datasets list...');
+      
       final response = await http.get(
-        Uri.parse('$kaggleApiUrl/datasets/list?sort_by=votes'),
+        Uri.parse('$kaggleApiUrl/datasets/list?sort_by=votes&max_size=50'),
         headers: {
           'Authorization': 'Basic $_basicAuth',
           'Content-Type': 'application/json',
         },
-      ).timeout(const Duration(seconds: 15));
+      ).timeout(const Duration(seconds: 30));
+
+      print('📡 Kaggle API Response Status: ${response.statusCode}');
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body);
+        print('✅ Retrieved ${data.length} datasets from Kaggle');
+        
         return data
             .map((item) => {
                   'id': item['ref'] ?? '',
                   'title': item['title'] ?? '',
+                  'description': item['subtitle'] ?? item['description'] ?? '',
                   'downloads': item['downloadCount'] ?? 0,
-                  'source': 'Kaggle',
+                  'usability': item['usabilityRating'] ?? 0.0,
+                  'owner': item['ownerName'] ?? 'Unknown',
+                  'source': 'Kaggle API (Live)',
+                  'url': 'https://www.kaggle.com/datasets/${item['ref']}',
+                  'size_bytes': item['datasetSizeBytes'] ?? 0,
+                  'last_updated': item['lastUpdated'] ?? 'Unknown',
                 })
             .toList();
+      } else if (response.statusCode == 401) {
+        print('❌ Authentication failed - using embedded data');
+        return _getEmbeddedDatasets();
       }
     } catch (e) {
-      print('Error fetching Kaggle datasets: $e');
+      print('❌ Error fetching Kaggle datasets: $e');
     }
 
     return _getEmbeddedDatasets();
@@ -185,25 +221,35 @@ class KaggleDataService {
 
   /// Get recommended PCOS datasets from Kaggle
   static Future<List<Map<String, dynamic>>> getRecommendedPcosDatasets() async {
-    final datasets = <Map<String, dynamic>>[];
+    print('🔎 Fetching recommended PCOS datasets from Kaggle...');
+    final allDatasets = <Map<String, dynamic>>[];
+    int successCount = 0;
 
+    // Search for each PCOS-related dataset category
     for (final dataset in kaggleDatasets) {
       try {
+        print('   📌 Searching: ${dataset['name']}');
         final results = await searchKaggleDatasets(dataset['ref']!);
-        if (results.isNotEmpty) {
-          datasets.addAll(results);
+        if (results.isNotEmpty && !results[0].containsKey('error')) {
+          allDatasets.addAll(results);
+          successCount++;
+          print('   ✅ ${dataset['name']}: Found ${results.length} datasets');
         }
       } catch (e) {
-        print('Error fetching ${dataset['name']}: $e');
+        print('   ⚠️ Error fetching ${dataset['name']}: $e');
       }
     }
 
-    // Return embedded data if no Kaggle results found
-    if (datasets.isEmpty) {
+    print('✅ Successfully fetched $successCount/${kaggleDatasets.length} dataset categories');
+
+    // Return Kaggle results if we got some, otherwise use embedded data
+    if (allDatasets.isNotEmpty) {
+      print('📊 Total Kaggle datasets retrieved: ${allDatasets.length}');
+      return allDatasets;
+    } else {
+      print('⚠️ No Kaggle datasets found, falling back to embedded data');
       return _getEmbeddedDatasets();
     }
-
-    return datasets;
   }
 
   /// Fallback to embedded datasets
@@ -240,55 +286,125 @@ class KaggleDataService {
     ];
   }
 
-  /// Get all available datasets
+  /// Get all available datasets - prioritizes Kaggle API, falls back to embedded
   static Future<List<Map<String, dynamic>>> getAvailableDatasets() async {
-    // Simulate async operation for consistency
-    await Future.delayed(Duration(milliseconds: 100));
+    print('📂 Loading available datasets...');
     
+    // Try to fetch from Kaggle first
+    try {
+      final kaggleLive = await getRecommendedPcosDatasets();
+      if (kaggleLive.isNotEmpty && !kaggleLive[0].containsKey('error')) {
+        print('✅ Using live Kaggle datasets (${kaggleLive.length} datasets)');
+        return kaggleLive;
+      }
+    } catch (e) {
+      print('⚠️ Failed to fetch Kaggle datasets: $e');
+    }
+
+    // Fallback to embedded data with metadata
+    print('📦 Using embedded datasets as fallback');
     return [
       {
         'name': 'PCOS Symptoms Dataset',
         'description': 'Common PCOS symptoms with prevalence rates and categories',
         'records': PCOSMonitoringDatasets.pcosSymptoms.length,
-        'source': 'Kaggle + Clinical Research',
+        'source': 'Kaggle + Clinical Research (Embedded)',
         'data': PCOSMonitoringDatasets.pcosSymptoms,
+        'is_embedded': true,
+        'accuracy': 'HIGH',
       },
       {
         'name': 'PCOS Treatments Dataset',
         'description': 'Treatment options including medications and lifestyle changes',
         'records': PCOSMonitoringDatasets.treatments.length,
-        'source': 'Kaggle + Clinical Studies',
+        'source': 'Kaggle + Clinical Studies (Embedded)',
         'data': PCOSMonitoringDatasets.treatments,
+        'is_embedded': true,
+        'accuracy': 'HIGH',
       },
       {
         'name': 'Lifestyle Recommendations',
         'description': 'Evidence-based lifestyle modifications for PCOS management',
         'records': PCOSMonitoringDatasets.lifestyleRecommendations.length,
-        'source': 'Research Studies',
+        'source': 'Research Studies (Embedded)',
         'data': PCOSMonitoringDatasets.lifestyleRecommendations,
+        'is_embedded': true,
+        'accuracy': 'HIGH',
       },
       {
         'name': 'Monitoring Metrics',
         'description': 'Key health metrics to track for PCOS diagnosis and management',
         'records': PCOSMonitoringDatasets.monitoringMetrics.length,
-        'source': 'Clinical Guidelines',
+        'source': 'Clinical Guidelines (Embedded)',
         'data': PCOSMonitoringDatasets.monitoringMetrics,
+        'is_embedded': true,
+        'accuracy': 'HIGH',
       },
       {
         'name': 'Lab Tests for PCOS',
         'description': 'Essential lab tests and their normal ranges for PCOS diagnosis',
         'records': PCOSMonitoringDatasets.labTests.length,
-        'source': 'Medical Guidelines',
+        'source': 'Medical Guidelines (Embedded)',
         'data': PCOSMonitoringDatasets.labTests,
+        'is_embedded': true,
+        'accuracy': 'HIGH',
       },
       {
         'name': 'Health Resources',
         'description': 'Research articles and clinical resources for PCOS education',
         'records': PCOSMonitoringDatasets.resources.length,
-        'source': 'Clinical Literature',
+        'source': 'Clinical Literature (Embedded)',
         'data': PCOSMonitoringDatasets.resources,
+        'is_embedded': true,
+        'accuracy': 'HIGH',
       },
     ];
+  }
+
+  /// Fetch dataset details from Kaggle API
+  static Future<Map<String, dynamic>?> fetchKaggleDatasetDetails(
+    String datasetRef,
+  ) async {
+    try {
+      print('📥 Fetching details for: $datasetRef');
+      
+      final response = await http.get(
+        Uri.parse('$kaggleApiUrl/datasets/view/$datasetRef'),
+        headers: {
+          'Authorization': 'Basic $_basicAuth',
+          'Content-Type': 'application/json',
+        },
+      ).timeout(const Duration(seconds: 20));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        print('✅ Retrieved dataset details for: $datasetRef');
+        
+        return {
+          'id': data['id'] ?? datasetRef,
+          'ref': data['ref'] ?? datasetRef,
+          'title': data['title'] ?? 'Unknown',
+          'description': data['description'] ?? '',
+          'owner': data['ownerName'] ?? 'Unknown',
+          'owner_url': data['ownerUrl'] ?? '',
+          'downloads': data['downloadCount'] ?? 0,
+          'usability': data['usabilityRating'] ?? 0.0,
+          'size_bytes': data['datasetSizeBytes'] ?? 0,
+          'columns': data['datasetColumns'] ?? [],
+          'last_updated': data['lastUpdated'] ?? '',
+          'creation_date': data['creationDate'] ?? '',
+          'is_featured': data['isFeatured'] ?? false,
+          'url': 'https://www.kaggle.com/datasets/$datasetRef',
+          'source': 'Kaggle API (Live)',
+        };
+      } else {
+        print('⚠️ Could not fetch dataset details (${response.statusCode})');
+      }
+    } catch (e) {
+      print('❌ Error fetching dataset details: $e');
+    }
+    
+    return null;
   }
 
   /// Search datasets by keyword
@@ -511,5 +627,102 @@ class KaggleDataService {
       return false;
     }
   }
-}
+
+  /// Initialize Kaggle API and test connection
+  static Future<Map<String, dynamic>> initializeKaggleAPI() async {
+    print('\n🚀 Initializing Kaggle API Integration...');
+    print('━' * 50);
+    
+    final status = <String, dynamic>{
+      'initialized': false,
+      'message': '',
+      'datasets_loaded': 0,
+      'source': 'embedded',
+      'timestamp': DateTime.now().toIso8601String(),
+    };
+
+    try {
+      print('🔐 Testing Kaggle API credentials...');
+      
+      // Test API connection by fetching a small dataset list
+      final testResponse = await http.get(
+        Uri.parse('$kaggleApiUrl/datasets/list?max_size=1'),
+        headers: {
+          'Authorization': 'Basic $_basicAuth',
+          'Content-Type': 'application/json',
+        },
+      ).timeout(const Duration(seconds: 15));
+
+      if (testResponse.statusCode == 200) {
+        print('✅ Kaggle API authentication successful!');
+        status['initialized'] = true;
+        status['message'] = 'Kaggle API connected successfully';
+        status['source'] = 'kaggle_api';
+        
+        // Try to fetch recommended datasets
+        print('📥 Fetching recommended PCOS datasets...');
+        final datasets = await getRecommendedPcosDatasets();
+        status['datasets_loaded'] = datasets.length;
+        status['live_data_available'] = true;
+        
+        if (datasets.isNotEmpty) {
+          print('✅ Loaded ${datasets.length} datasets from Kaggle API');
+          print('📊 Dataset sources:');
+          final sources = <String>{};
+          for (var ds in datasets) {
+            sources.add(ds['source'] ?? 'Unknown');
+          }
+          for (var source in sources) {
+            print('   • $source');
+          }
+        }
+      } else if (testResponse.statusCode == 401) {
+        print('⚠️ Kaggle API authentication failed (401 Unauthorized)');
+        print('   Using embedded datasets as fallback');
+        status['message'] = 'Using embedded datasets (API auth failed)';
+        status['initialized'] = false;
+      } else {
+        print('⚠️ Kaggle API error (${testResponse.statusCode})');
+        print('   Using embedded datasets as fallback');
+        status['message'] = 'Using embedded datasets (API error)';
+      }
+    } catch (e) {
+      print('❌ Kaggle API connection failed: $e');
+      print('   Using embedded datasets as fallback');
+      status['message'] = 'Using embedded datasets (connection failed)';
+      status['error'] = e.toString();
+    }
+
+    print('━' * 50);
+    print('📊 Status: ${status['message']}\n');
+    return status;
+  }
+
+  /// Get Kaggle API status
+    static Future<Map<String, dynamic>> getAPIStatus() async {
+      try {
+        final response = await http.get(
+          Uri.parse('$kaggleApiUrl/datasets/list?max_size=1'),
+          headers: {
+            'Authorization': 'Basic $_basicAuth',
+            'Content-Type': 'application/json',
+          },
+        ).timeout(const Duration(seconds: 10));
+  
+        return {
+          'connected': response.statusCode == 200,
+          'status_code': response.statusCode,
+          'authenticated': response.statusCode != 401,
+          'api_url': kaggleApiUrl,
+          'timestamp': DateTime.now().toIso8601String(),
+        };
+      } catch (e) {
+        return {
+          'connected': false,
+          'error': e.toString(),
+          'timestamp': DateTime.now().toIso8601String(),
+        };
+      }
+    }
+  }
 
