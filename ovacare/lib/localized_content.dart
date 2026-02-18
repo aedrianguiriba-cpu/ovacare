@@ -528,3 +528,365 @@ List<String> getMoodTips(String mood) {
   if (recommendations == null) return [];
   return List<String>.from(recommendations['tips'] as List? ?? []);
 }
+
+// ========================================
+// MOOD-BASED WORKOUT RECOMMENDATIONS FOR PCOS
+// Filipino-friendly YouTube workout videos organized by mood
+// ========================================
+
+const moodBasedWorkoutRecommendations = {
+  'Happy': {
+    'focus': 'Fun, energetic workouts to sustain your positive mood and maximize feel-good endorphins.',
+    'tips': [
+      'Channel your happy energy into movement',
+      'Try dancing or upbeat cardio',
+      'Share your workout journey with friends',
+    ],
+    'workouts': [
+      {
+        'name': '4-Minute PCOS Workout for Women',
+        'creator': 'Team FitFil (PH)',
+        'duration': '4 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=oZKQqd9XRkU',
+        'description': 'Quick, energizing PCOS-specific workout from a Filipino fitness team. Perfect for maintaining your happy mood.',
+        'benefits': ['Quick energy boost', 'PCOS-specific routine', 'Filipino creator'],
+      },
+      {
+        'name': '20-Min Boosted Walk',
+        'creator': 'Walk at Home',
+        'duration': '20 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=m9yI2LGZRE0',
+        'description': 'Upbeat walking workout to keep your energy high and spirits lifted.',
+        'benefits': ['Mood boosting', 'Low impact', 'Easy to follow'],
+      },
+      {
+        'name': 'Balik-Alindog No Equipment Routine',
+        'creator': 'Anne Aniag (PH)',
+        'duration': '10+ min',
+        'difficulty': 'Intermediate',
+        'videoUrl': 'https://www.youtube.com/watch?v=obZ81fdObiI',
+        'description': 'Fun Filipino fitness routine to get your body moving and maintain your positive energy.',
+        'benefits': ['No equipment needed', 'Filipino creator', 'Full body workout'],
+      },
+    ],
+  },
+  'Tired': {
+    'focus': 'Gentle, low-energy workouts to help boost energy without overwhelming your body.',
+    'tips': [
+      'Start with very light movement',
+      'Listen to your body and rest when needed',
+      'Even 10 minutes of gentle movement helps',
+    ],
+    'workouts': [
+      {
+        'name': '10-Min Gentle Low Impact',
+        'creator': 'Lucy Wyndham-Read',
+        'duration': '10 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=PqqJBaE4srs',
+        'description': 'Very gentle, low-impact workout perfect for when you\'re feeling tired but want to move.',
+        'benefits': ['Very gentle', 'Energy boosting', 'Short duration'],
+      },
+      {
+        'name': '10-Min Low Impact Cardio',
+        'creator': 'Lucy Wyndham-Read',
+        'duration': '10 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=lZOH05EBEZI',
+        'description': 'Quick, gentle cardio to help increase energy levels gradually.',
+        'benefits': ['Low intensity', 'Beginner friendly', 'Quick routine'],
+      },
+      {
+        'name': 'Easy Yoga for the Pinoy',
+        'creator': 'PH Yoga Creator',
+        'duration': '15+ min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=WvSF2EkOUh8',
+        'description': 'Relaxing yoga routine designed for Filipinos. Gentle stretches to restore energy.',
+        'benefits': ['Restorative', 'Filipino-friendly', 'Stress relief'],
+      },
+    ],
+  },
+  'Anxious': {
+    'focus': 'Calming, steady workouts to help reduce anxiety and promote relaxation.',
+    'tips': [
+      'Focus on deep breathing during exercise',
+      'Avoid high-intensity workouts when anxious',
+      'Walking and yoga are excellent for anxiety',
+    ],
+    'workouts': [
+      {
+        'name': 'Easy Yoga for the Pinoy',
+        'creator': 'PH Yoga Creator',
+        'duration': '15+ min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=WvSF2EkOUh8',
+        'description': 'Calming yoga routine to help center your mind and reduce anxious feelings.',
+        'benefits': ['Anxiety-reducing', 'Deep breathing', 'Mindfulness'],
+      },
+      {
+        'name': '20-Min Indoor Walk Workout',
+        'creator': 'Walk at Home',
+        'duration': '20 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=-SSYX8sIOmM',
+        'description': 'Steady, rhythmic walking workout that helps calm anxious thoughts through movement.',
+        'benefits': ['Rhythmic movement', 'Indoor friendly', 'Calming pace'],
+      },
+      {
+        'name': '20-Min Walk at Home Routine',
+        'creator': 'Walk at Home',
+        'duration': '20 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=TRtuK_pfvIg',
+        'description': 'Gentle walking routine to help manage anxiety through consistent, calming movement.',
+        'benefits': ['Stress relief', 'Easy pace', 'No equipment'],
+      },
+    ],
+  },
+  'Sad': {
+    'focus': 'Mood-lifting workouts to boost endorphins and help elevate your spirits.',
+    'tips': [
+      'Any movement is better than none',
+      'Walking releases natural mood boosters',
+      'Don\'t push too hard - be gentle with yourself',
+    ],
+    'workouts': [
+      {
+        'name': '20-Min Healthier Life Walk',
+        'creator': 'Walk at Home',
+        'duration': '20 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=UR0D0R2zdPY',
+        'description': 'Uplifting walking workout designed to boost your mood and energy.',
+        'benefits': ['Endorphin release', 'Mood lifting', 'Gentle movement'],
+      },
+      {
+        'name': '20-Min Walk Workout',
+        'creator': 'Walk at Home',
+        'duration': '20 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=xkNgd0HJQgQ',
+        'description': 'Simple walking routine to help lift your spirits through gentle exercise.',
+        'benefits': ['Easy to start', 'Mood boosting', 'Low barrier'],
+      },
+      {
+        'name': '7-Minute PCOS Hormone Balance Workout',
+        'creator': 'Lucy Wyndham-Read',
+        'duration': '7 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=vnJH2Ba0CM0',
+        'description': 'Quick PCOS-specific workout to help balance hormones and improve mood.',
+        'benefits': ['Hormone support', 'Quick routine', 'PCOS-focused'],
+      },
+    ],
+  },
+  'Energetic': {
+    'focus': 'Channel your high energy into productive, effective workouts.',
+    'tips': [
+      'Use your energy for more intense workouts',
+      'Great day for full-body routines',
+      'Push yourself but stay safe',
+    ],
+    'workouts': [
+      {
+        'name': 'BEST WORKOUT Para Lumiit ang Tiyan',
+        'creator': 'PH Creator',
+        'duration': '15+ min',
+        'difficulty': 'Intermediate',
+        'videoUrl': 'https://www.youtube.com/watch?v=D5DdBrq0_yc',
+        'description': 'Effective Filipino workout targeting the belly area. Perfect for when you have high energy.',
+        'benefits': ['Core focused', 'Filipino creator', 'Effective routine'],
+      },
+      {
+        'name': 'Balik-Alindog No Equipment Routine',
+        'creator': 'Anne Aniag (PH)',
+        'duration': '10+ min',
+        'difficulty': 'Intermediate',
+        'videoUrl': 'https://www.youtube.com/watch?v=obZ81fdObiI',
+        'description': 'Full-body workout from a Filipino fitness creator. Channel your energy productively.',
+        'benefits': ['Full body', 'No equipment', 'Filipino creator'],
+      },
+      {
+        'name': '30-Min Fast Walking Workout',
+        'creator': 'Walk at Home',
+        'duration': '30 min',
+        'difficulty': 'Intermediate',
+        'videoUrl': 'https://www.youtube.com/watch?v=enYITYwvPAQ',
+        'description': 'Fast-paced walking workout to match your high energy level.',
+        'benefits': ['Higher intensity', 'Cardio boost', 'Energy matching'],
+      },
+    ],
+  },
+  'Irritable': {
+    'focus': 'Controlled, focused workouts to release tension and restore calm.',
+    'tips': [
+      'Exercise can help release pent-up frustration',
+      'Focus on controlled movements',
+      'Avoid over-exertion which can increase irritability',
+    ],
+    'workouts': [
+      {
+        'name': '15-Min Low Impact Cardio',
+        'creator': 'HASfit',
+        'duration': '15 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=VWj8ZxCxrYk',
+        'description': 'Controlled, low-impact workout to help release tension without overexertion.',
+        'benefits': ['Tension release', 'Controlled pace', 'Calming'],
+      },
+      {
+        'name': '20-Min No Jump Workout',
+        'creator': 'HASfit',
+        'duration': '20 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=WjH-NQDeQ3o',
+        'description': 'No-jump workout that helps release frustration through steady, controlled movement.',
+        'benefits': ['Joint-friendly', 'Frustration release', 'Steady pace'],
+      },
+      {
+        'name': 'Gawin Ito Para Lumiit ang Tiyan (No squat/lunge/jump)',
+        'creator': 'PH Creator',
+        'duration': '15+ min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=p6IrmUpt9Fw',
+        'description': 'Joint-friendly Filipino workout. No squats, lunges, or jumps - perfect for controlled exercise.',
+        'benefits': ['Joint-safe', 'Filipino creator', 'Focused routine'],
+      },
+    ],
+  },
+  'Calm': {
+    'focus': 'Maintain your balanced state with moderate, enjoyable workouts.',
+    'tips': [
+      'Great time for consistent exercise routine',
+      'Mix of light cardio and strength works well',
+      'Enjoy the movement without pressure',
+    ],
+    'workouts': [
+      {
+        'name': '20-Min Morning Low Impact Workout',
+        'creator': 'MadFit',
+        'duration': '20 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=m1DBJhxKmiU',
+        'description': 'Balanced morning workout to maintain your calm, centered state.',
+        'benefits': ['Balanced routine', 'Morning friendly', 'Maintains calm'],
+      },
+      {
+        'name': '15-Min Low Impact Full Body',
+        'creator': 'MadFit',
+        'duration': '15 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=9PCGvkXV-Bo',
+        'description': 'Gentle full-body workout that complements your calm mood.',
+        'benefits': ['Full body', 'Moderate pace', 'Well-rounded'],
+      },
+      {
+        'name': '20-Min Low Impact Full Body',
+        'creator': 'MadFit',
+        'duration': '20 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=yeLfaC9XIzQ',
+        'description': 'Complete low-impact workout for maintaining your peaceful energy.',
+        'benefits': ['Complete workout', 'Low impact', 'Peaceful pace'],
+      },
+    ],
+  },
+  'Stressed': {
+    'focus': 'Stress-relieving workouts to help you decompress and find peace.',
+    'tips': [
+      'Exercise is one of the best stress relievers',
+      'Focus on breathing throughout',
+      'Walking and yoga are excellent for stress',
+    ],
+    'workouts': [
+      {
+        'name': 'Easy Yoga for the Pinoy',
+        'creator': 'PH Yoga Creator',
+        'duration': '15+ min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=WvSF2EkOUh8',
+        'description': 'Relaxing yoga routine to help release stress and tension.',
+        'benefits': ['Stress relief', 'Deep breathing', 'Relaxation'],
+      },
+      {
+        'name': '30-Min Low Impact Cardio',
+        'creator': 'Body Project',
+        'duration': '30 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=gC_L9qAHVJ8',
+        'description': 'Extended low-impact workout to help process stress through movement.',
+        'benefits': ['Longer duration', 'Stress processing', 'Endurance building'],
+      },
+      {
+        'name': '7-Minute PCOS Hormone Balance Workout',
+        'creator': 'Lucy Wyndham-Read',
+        'duration': '7 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=vnJH2Ba0CM0',
+        'description': 'Quick hormone-balancing workout. Stress affects PCOS hormones, so this helps on multiple levels.',
+        'benefits': ['Quick stress relief', 'Hormone support', 'PCOS-specific'],
+      },
+    ],
+  },
+  'Neutral': {
+    'focus': 'Balanced, general fitness workouts for maintaining your health.',
+    'tips': [
+      'Good opportunity to try new workout styles',
+      'Focus on building consistency',
+      'Mix up intensity levels throughout the week',
+    ],
+    'workouts': [
+      {
+        'name': '20-Min No Repeat Low Impact',
+        'creator': 'MadFit',
+        'duration': '20 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=J8EeluUr4ak',
+        'description': 'Varied, non-repetitive workout to keep things interesting.',
+        'benefits': ['Variety', 'Engaging', 'Full body'],
+      },
+      {
+        'name': '20-Min Beginner Low Impact',
+        'creator': 'Body Project',
+        'duration': '20 min',
+        'difficulty': 'Beginner',
+        'videoUrl': 'https://www.youtube.com/watch?v=x3aogIZfVUI',
+        'description': 'Well-rounded beginner workout for general fitness maintenance.',
+        'benefits': ['Beginner friendly', 'Comprehensive', 'Easy to follow'],
+      },
+      {
+        'name': '45-Min Low Impact Full Body',
+        'creator': 'Body Project',
+        'duration': '45 min',
+        'difficulty': 'Intermediate',
+        'videoUrl': 'https://www.youtube.com/watch?v=q2OvUyIArOg',
+        'description': 'Complete full-body session for when you have more time and want a thorough workout.',
+        'benefits': ['Comprehensive', 'Full session', 'All muscle groups'],
+      },
+    ],
+  },
+};
+
+/// Get workout recommendations based on the user's current mood
+Map<String, dynamic>? getWorkoutRecommendationsForMood(String mood) {
+  return moodBasedWorkoutRecommendations[mood];
+}
+
+/// Get a quick list of top workout names for a mood
+List<String> getTopWorkoutsForMood(String mood) {
+  final recommendations = moodBasedWorkoutRecommendations[mood];
+  if (recommendations == null) return [];
+  final workouts = recommendations['workouts'] as List?;
+  if (workouts == null) return [];
+  return workouts.map((w) => w['name'] as String).toList();
+}
+
+/// Get workout mood-specific tips
+List<String> getWorkoutMoodTips(String mood) {
+  final recommendations = moodBasedWorkoutRecommendations[mood];
+  if (recommendations == null) return [];
+  return List<String>.from(recommendations['tips'] as List? ?? []);
+}

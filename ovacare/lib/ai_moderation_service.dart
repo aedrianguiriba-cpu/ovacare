@@ -142,6 +142,21 @@ class AIModerationService {
       'ovary': 'Symptoms',
       'treatment': 'Treatment',
       'medication': 'Treatment',
+      // Tagalog mappings
+      'regla': 'Symptoms',
+      'irregular': 'Symptoms',
+      'irregular na regla': 'Symptoms',
+      'walang regla': 'Symptoms',
+      'buntis': 'Fertility',
+      'pagbubuntis': 'Fertility',
+      'gamot': 'Treatment',
+      'doktor': 'Treatment',
+      'kista': 'Support',
+      'ovaryo': 'Symptoms',
+      'timbang': 'Lifestyle',
+      'dieta': 'Lifestyle',
+      'ehersisyo': 'Lifestyle',
+      'sintomas': 'Symptoms',
     };
 
     final suggested = <String>[];
@@ -175,6 +190,79 @@ class AIModerationService {
       lastUpdated: DateTime.now().toIso8601String(),
       dataQuality: 'high',
     );
+  }
+
+  /// Analyzes if a post is relevant to PCOS and extracts key information
+  Future<Map<String, dynamic>> analyzePcosRelevance(String title, String content) async {
+    try {
+      final fullText = '$title\n$content'.toLowerCase();
+      
+      // PCOS-related keywords and terms
+      const pcosTerms = [
+        'pcos', 'polycystic', 'ovary', 'ovarian', 'ovaryo', 'ovaryo', 'hormone', 'insulin',
+        'period', 'menstrual', 'regla', 'irregular na regla', 'hindi regular ang regla', 'walang regla', 'cycle', 'irregular', 'fertility', 'pregnancy', 'buntis', 'pagbubuntis',
+        'hirsutism', 'hirsutismo', 'sobra ang buhok', 'labis na buhok', 'acne', 'pimples', 'tigyawat', 'weight', 'timbang', 'diet', 'dieta', 'metformin', 'inositol', 'ovulation',
+        'androgen', 'testosterone', 'estrogen', 'progesterone', 'cyst', 'kista',
+        'ultrasound', 'diagnosis', 'diagnostiko', 'symptom', 'sintomas', 'treatment', 'gamot', 'medication'
+      ];
+
+      // Count detected PCOS terms
+      final detectedTerms = <String>[];
+      for (final term in pcosTerms) {
+        if (fullText.contains(term)) {
+          detectedTerms.add(term);
+        }
+      }
+
+      // Calculate relevance score (0.0 to 1.0)
+      final relevanceScore = detectedTerms.length / pcosTerms.length;
+
+      // Determine primary topic based on keywords
+      String primaryTopic = 'general';
+      if (fullText.contains('diet') || fullText.contains('food') || fullText.contains('nutrition')) {
+        primaryTopic = 'diet';
+      } else if (fullText.contains('exercise') || fullText.contains('fitness') || fullText.contains('workout')) {
+        primaryTopic = 'exercise';
+      } else if (fullText.contains('hormone') || fullText.contains('medication') || fullText.contains('treatment')) {
+        primaryTopic = 'medical';
+      } else if (fullText.contains('period') || fullText.contains('menstrual') || fullText.contains('cycle')) {
+        primaryTopic = 'menstrual';
+      } else if (fullText.contains('fertility') || fullText.contains('pregnancy') || fullText.contains('ovulation')) {
+        primaryTopic = 'fertility';
+      } else if (fullText.contains('mental') || fullText.contains('anxiety') || fullText.contains('depression')) {
+        primaryTopic = 'mental-health';
+      }
+
+      // Determine if post is PCOS-relevant (allow 1 core term or related keyword)
+      int relatedCount = 0;
+      for (final kw in relatedKeywords) {
+        relatedCount += _countOccurrences(fullText, kw);
+      }
+
+      final isPcosRelevant = detectedTerms.length >= 1 || relatedCount >= 1;
+
+      return {
+        'approved': isPcosRelevant,
+        'relevance_score': relevanceScore,
+        'primary_topic': primaryTopic,
+        'detected_terms': detectedTerms,
+        'is_pcos_relevant': isPcosRelevant,
+        'message': isPcosRelevant
+          ? 'Post is relevant to PCOS'
+          : 'Post does not appear to be PCOS-related. Please ensure your post is relevant to PCOS topics. Tip: mention symptoms (period, acne), diagnosis (PCOS), or treatments (metformin).',
+      };
+    } catch (e) {
+      print('Error analyzing PCOS relevance: $e');
+      // Default to approved if analysis fails
+      return {
+        'approved': true,
+        'relevance_score': 0.5,
+        'primary_topic': 'general',
+        'detected_terms': [],
+        'is_pcos_relevant': true,
+        'message': 'Analysis unavailable',
+      };
+    }
   }
 }
 
@@ -773,15 +861,21 @@ class ForumRelevanceAnalyzer {
         geminiConfidence >= 40);
     
     // More lenient approval for PCOS-related content
-    // Must have PCOS core terms and reasonable content, no spam
-    // OR Gemini detected relevant Tagalog content
-    final hasPcosKeywords = hasPcosCoreTerm || coreScore > 25;
+    // Accept a single detected term or related keyword, lower score thresholds
+    final hasPcosKeywords = hasPcosCoreTerm || coreScore > 10;
+    final relaxedScoreThreshold = 20.0;
+    // Accept posts with at least one detected PCOS term OR some related keywords
+    final detectedTermsCount = _getDetectedTerms(combinedText).length;
+    final hasRelatedKeywords = (symptomScore + treatmentScore + lifestyleScore) > 0;
+
     final isPcosRelevant = !spamIndicators['isSpam'] &&
-        hasProperSpacing &&
-        (hasPcosCoreTerm || 
-         (hasPcosKeywords && finalRelevanceScore >= 30) || 
-         geminiApprovedTagalog) && // Allow Gemini to approve Tagalog content
-        contentLength >= 5; // Minimum 5 words (more lenient)
+      hasProperSpacing &&
+      (hasPcosCoreTerm ||
+        detectedTermsCount >= 1 ||
+        (hasPcosKeywords && finalRelevanceScore >= relaxedScoreThreshold) ||
+        geminiApprovedTagalog ||
+        hasRelatedKeywords) &&
+      contentLength >= 3; // Minimum 3 words (more lenient)
 
     // Generate detailed feedback
     final feedback = _generateFeedback(

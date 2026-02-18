@@ -5,7 +5,8 @@ import 'dart:async';
 /// Free AI moderation using Google Gemini API
 /// Get free API key at: https://ai.google.dev
 class GeminiModerationService {
-  static const String _geminiModel = 'gemini-3-flash-preview';
+  // Use Gemini 2.5 Pro for improved moderation & language handling
+  static const String _geminiModel = 'gemini-2.5-pro';
   static const String _baseUrl = 'https://generativelanguage.googleapis.com/v1beta/models';
   
   static String? _apiKey;
@@ -69,7 +70,7 @@ Common Tagalog PCOS terms to recognize:
 - "buhok/hair" (hair issues - hirsutism or hair loss)
 
 Respond with ONLY this JSON format (no extra text):
-{"isRelevant":true/false,"confidence":0-100,"isSafe":true/false,"hasPCOS":true/false,"language":"detected_language_code","isTagalog":true/false,"detectedTopics":["topic1","topic2"]}
+{"isRelevant":true/false,"confidence":0-100,"isSafe":true/false,"hasPCOS":true/false,"language":"detected_language_code","isTagalog":true/false,"detectedTopics":["topic1","topic2"],"suggested_tags":["tag1","tag2"]}
 
 Where:
 - isRelevant: true if post is about PCOS, women's health, fertility, hormones, menstrual health
@@ -148,6 +149,7 @@ Content: $content''';
             'hasHealthContent': (analysis['hasPCOS'] ?? false) == true,
             'isSafe': (analysis['isSafe'] ?? true) == true,
             'qualityScore': ((analysis['confidence'] ?? 0) as num).toDouble(),
+            'suggested_tags': (analysis['suggested_tags'] as List?)?.cast<String>() ?? [],
             'entities': [],
             'summary': isTagalog 
                 ? 'Gemini analysis complete (Tagalog detected)' 

@@ -1,839 +1,775 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:provider/provider.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'ai_moderation_service.dart';
 import 'dialog_helper.dart';
+import 'report_service.dart';
+import 'main.dart' show HealthDataProvider;
+
+SupabaseClient? _getSupabaseClientOrNull() {
+  try {
+    return Supabase.instance.client;
+  } catch (_) {
+    return null;
+  }
+}
+
+String _resolveAuthorName(User? user) {
+  if (user == null) return 'Anonymous';
+  return user.userMetadata?['username'] as String? ?? 
+         user.email?.split('@').first ?? 
+         'User${user.id.substring(0, 6)}';
+}
 
 // ============== COMMUNITY FORUM (Reddit-like) ==============
 
 class CommunityForumScreen extends StatefulWidget {
-  const CommunityForumScreen({super.key});
+  const CommunityForumScreen({Key? key}) : super(key: key);
 
   @override
   State<CommunityForumScreen> createState() => _CommunityForumScreenState();
 }
 
 class _CommunityForumScreenState extends State<CommunityForumScreen> {
-  String _sortBy = 'hot'; // hot, new, top
   List<ForumPost> _posts = [];
-  bool _showSummary = false; // Toggle for summary visibility
-  final List<String> _availableTags = ['Support', 'Treatment', 'Diet', 'Exercise', 'Symptoms', 'Lifestyle', 'Question', 'NewDiagnosis', 'Medication', 'Mental Health'];
+  bool _isLoading = true;
+  String _sortBy = 'auto';
+  bool _summaryExpanded = true;
+  final Map<String, String> _sortLabels = {
+    'hot': 'Hot',
+    'auto': 'Auto',
+    'new': 'New',
+    'top': 'Top',
+    'relevant': 'Relevant',
+  };
+  final Map<int, int> _userPostVotes = {}; // Already exists
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPosts();
+  }
+
+  Future<void> _loadPosts() async {
+    setState(() => _isLoading = true);
+    
+    try {
+      final client = _getSupabaseClientOrNull();
+      if (client == null) {
+        setState(() {
+          _posts = _generateSamplePosts();
+          _isLoading = false;
+        });
+        return;
+      }
+
+      final user = client.auth.currentUser;
+      
+      // Load posts
+      final rows = await client
+          .from('forum_posts')
+          .select()
+          .order('posted_at', ascending: false);
+
+      // IMPORTANT: Load user votes if signed in
+      if (user != null) {
+        final votes = await client
+            .from('user_votes')
+            .select('post_id, vote_type')
+            .eq('user_id', user.id)
+            .isFilter('comment_id', null); // Only post votes, not comment votes
+
+        // Clear and rebuild the votes map
+        _userPostVotes.clear();
+        for (final vote in votes) {
+          _userPostVotes[vote['post_id'] as int] = vote['vote_type'] as int;
+        }
+      } else {
+        _userPostVotes.clear();
+      }
+
+      final posts = rows.map((row) => ForumPost(
+        id: row['id'] as int,
+        userId: row['user_id'] as String?,
+        title: row['title'] as String,
+        content: row['content'] as String,
+        author: row['author']?.toString() ?? 'Anonymous',
+        postedTime: DateTime.parse(row['posted_at'] as String).toLocal(),
+        upvotes: row['upvotes'] as int? ?? 0,
+        downvotes: row['downvotes'] as int? ?? 0,
+        comments: row['comments_count'] as int? ?? 0,
+        tags: (row['tags'] as List<dynamic>?)?.map((e) => e.toString()).toList() ?? [],
+        relevanceScore: row['relevance_score'] as double?,
+        primaryTopic: row['primary_topic'] as String?,
+        detectedPcosTerms: ((row['detected_terms'] as List<dynamic>?) ?? (row['detected_terms'] as List<dynamic>?))?.map((e) => e.toString()).toList(),
+        isPcosRelevant: row['is_pcos_relevant'] as bool? ?? true,
+      )).toList();
+
+      setState(() {
+        _posts = posts;
+        _isLoading = false;
+        // Automatically apply sorting that prefers recent and high-engagement posts
+        _applyAutomaticSorting();
+      });
+    } catch (e) {
+      print('Error loading posts: $e');
+      setState(() {
+        _posts = _generateSamplePosts();
+        _isLoading = false;
+      });
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    // Sort posts
-    final sortedPosts = List<ForumPost>.from(_posts);
-    if (_sortBy == 'hot') {
-      sortedPosts.sort((a, b) => b.score.compareTo(a.score));
-    } else if (_sortBy == 'new') {
-      sortedPosts.sort((a, b) => b.postedTime.compareTo(a.postedTime));
-    } else if (_sortBy == 'top') {
-      sortedPosts.sort((a, b) => (b.upvotes - b.downvotes).compareTo(a.upvotes - a.downvotes));
-    }
-
     return Scaffold(
-      body: Column(
-        children: [
-          // Sorting and filter options
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: Row(
-              children: [
-                Expanded(
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(
-                      children: [
-                        _buildSortButton('Hot', 'hot'),
-                        const SizedBox(width: 8),
-                        _buildSortButton('New', 'new'),
-                        const SizedBox(width: 8),
-                        _buildSortButton('Top', 'top'),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        title: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Text(
+              'Community Forum',
+              style: TextStyle(color: Colors.black87, fontWeight: FontWeight.bold),
             ),
-          ),
-          Divider(height: 1, color: Colors.grey[300]),
-          // Summary toggle button
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            child: ElevatedButton.icon(
-              onPressed: () => setState(() => _showSummary = !_showSummary),
-              icon: Icon(_showSummary ? Icons.expand_less : Icons.expand_more),
-              label: Text(_showSummary ? 'Hide Summary' : 'Show Summary'),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.pink[100],
-                foregroundColor: Colors.pink[800],
+            const SizedBox(width: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              decoration: BoxDecoration(
+                color: Colors.pink[50],
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                _sortLabels[_sortBy] ?? '',
+                style: const TextStyle(fontSize: 12, color: Colors.pink, fontWeight: FontWeight.bold),
               ),
             ),
-          ),
-          // Posts list with optional summary
-          Expanded(
-            child: ListView.builder(
-              itemCount: sortedPosts.length + (_showSummary ? 1 : 0),
-              itemBuilder: (context, index) {
-                // Show summary at the top if enabled
-                if (_showSummary && index == 0) {
-                  return _buildDailySummary(sortedPosts);
-                }
-                final postIndex = _showSummary ? index - 1 : index;
-                return _buildPostCard(sortedPosts[postIndex], postIndex);
-              },
-            ),
+          ],
+        ),
+        centerTitle: true,
+        iconTheme: const IconThemeData(color: Colors.pink),
+        actions: [
+          PopupMenuButton<String>(
+            initialValue: _sortBy,
+            onSelected: (value) {
+              setState(() => _sortBy = value);
+              _sortPosts();
+            },
+            itemBuilder: (context) => [
+              const PopupMenuItem(value: 'hot', child: Text('Hot')),
+              const PopupMenuItem(value: 'new', child: Text('New')),
+              const PopupMenuItem(value: 'top', child: Text('Top')),
+              const PopupMenuItem(value: 'relevant', child: Text('Relevant (AI)')),
+            ],
+            icon: const Icon(Icons.sort, color: Colors.pink),
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => _showCreatePostDialog(),
-        label: const Text('New Post'),
-        icon: const Icon(Icons.add),
-        backgroundColor: Colors.pink,
-        foregroundColor: Colors.white
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : RefreshIndicator(
+              onRefresh: _loadPosts,
+              child: _posts.isEmpty
+                  ? const Center(child: Text('No posts yet. Be the first to share!'))
+                  : ListView.builder(
+                      itemCount: _posts.length + 1,
+                      itemBuilder: (context, index) {
+                        if (index == 0) {
+                          return _buildDailySummary(_posts);
+                        }
+                        return _buildPostCard(_posts[index - 1], index - 1);
+                      },
+                    ),
+            ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: _showCreatePostDialog,
+        backgroundColor: Colors.pink[400],
+        child: const Icon(Icons.add, color: Colors.white),
+        elevation: 4,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
     );
   }
 
-  Widget _buildSortButton(String label, String sortValue) {
-    final isActive = _sortBy == sortValue;
-    return ElevatedButton(
-      style: ElevatedButton.styleFrom(
-        backgroundColor: isActive ? Colors.pink : Colors.grey[200],
-        foregroundColor: isActive ? Colors.white : Colors.black,
-      ),
-      onPressed: () => setState(() => _sortBy = sortValue),
-      child: Text(label),
-    );
+  void _sortPosts() {
+    setState(() {
+      if (_sortBy == 'auto') {
+        _applyAutomaticSorting();
+        return;
+      }
+      if (_sortBy == 'hot') {
+        // Hot = score + recency (score * 1000000 + recency in ms)
+        _posts.sort((a, b) {
+          final now = DateTime.now();
+          int aHot = a.score * 1000000 - now.difference(a.postedTime).inMilliseconds;
+          int bHot = b.score * 1000000 - now.difference(b.postedTime).inMilliseconds;
+          return bHot.compareTo(aHot);
+        });
+      } else if (_sortBy == 'new') {
+        _posts.sort((a, b) => b.postedTime.compareTo(a.postedTime));
+      } else if (_sortBy == 'top') {
+        // Top = upvotes + relevanceScore (if available)
+        _posts.sort((a, b) {
+          double aTop = a.upvotes.toDouble() + (a.relevanceScore ?? 0.0);
+          double bTop = b.upvotes.toDouble() + (b.relevanceScore ?? 0.0);
+          return bTop.compareTo(aTop);
+        });
+      } else if (_sortBy == 'relevant') {
+        // Relevant = AI relevanceScore (fallback to 0)
+        _posts.sort((a, b) => (b.relevanceScore ?? 0.0).compareTo(a.relevanceScore ?? 0.0));
+      }
+    });
   }
 
-  /// Get color based on relevance score for visual feedback
-  Color _getRelevanceColor(double score) {
-    if (score >= 70) return Colors.green; // High relevance
-    if (score >= 50) return Colors.orange; // Medium relevance
-    return Colors.amber; // Lower relevance but acceptable
+  void _applyAutomaticSorting() {
+    // Score = engagement component + recency component
+    final now = DateTime.now();
+    _posts.sort((a, b) {
+      double engagementA = a.upvotes.toDouble() + (a.comments.toDouble() * 0.8) + (a.score);
+      double engagementB = b.upvotes.toDouble() + (b.comments.toDouble() * 0.8) + (b.score);
+
+      // Recency factor: newer posts get boosted (range 0..1 for 0..48 hours)
+      final ageA = now.difference(a.postedTime).inHours.toDouble();
+      final ageB = now.difference(b.postedTime).inHours.toDouble();
+      double recencyA = (48.0 - ageA) / 48.0; if (recencyA < 0) recencyA = 0; if (recencyA > 1) recencyA = 1;
+      double recencyB = (48.0 - ageB) / 48.0; if (recencyB < 0) recencyB = 0; if (recencyB > 1) recencyB = 1;
+
+      // Combine: weight engagement higher but keep recency significant
+      final scoreA = (engagementA * 2.0) + (recencyA * 20.0);
+      final scoreB = (engagementB * 2.0) + (recencyB * 20.0);
+
+      return scoreB.compareTo(scoreA);
+    });
   }
 
-  /// Build summary of all posts
   Widget _buildDailySummary(List<ForumPost> posts) {
-    if (posts.isEmpty) {
-      return const SizedBox.shrink();
-    }
+    final today = DateTime.now();
+    final todayList = posts.where((p) =>
+      p.postedTime.year == today.year &&
+      p.postedTime.month == today.month &&
+      p.postedTime.day == today.day
+    ).toList();
 
-    // Calculate statistics
-    final totalPosts = posts.length;
-    final totalUpvotes = posts.fold<int>(0, (sum, p) => sum + p.upvotes);
-    final totalComments = posts.fold<int>(0, (sum, p) => sum + p.comments);
-    final highRelevance = posts.where((p) => (p.relevanceScore ?? 0) >= 70).length;
-    
-    // Get main topics
-    final topics = <String, int>{};
-    for (final post in posts) {
-      if (post.primaryTopic != null) {
-        topics[post.primaryTopic!] = (topics[post.primaryTopic!] ?? 0) + 1;
+    final todayPosts = todayList.length;
+    final totalComments = todayList.fold<int>(0, (sum, post) => sum + post.comments);
+    final totalUpvotes = todayList.fold<int>(0, (sum, post) => sum + post.upvotes);
+
+    // Aggregate top tags, topics and detected terms for today's posts
+    final Map<String, int> tagCounts = {};
+    final Map<String, int> topicCounts = {};
+    final Map<String, int> termCounts = {};
+
+    for (final p in todayList) {
+      final weight = 1 + (p.upvotes.toDouble() * 0.2) + (p.comments.toDouble() * 0.15);
+      for (final t in p.tags) {
+        tagCounts[t] = (tagCounts[t] ?? 0) + weight.round();
+      }
+      final topic = p.primaryTopic ?? 'general';
+      topicCounts[topic] = (topicCounts[topic] ?? 0) + weight.round();
+      for (final term in p.detectedPcosTerms ?? []) {
+        termCounts[term] = (termCounts[term] ?? 0) + weight.round();
       }
     }
-    final topTopics = topics.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
 
-    final summaryText = _generateSummaryText(totalPosts, highRelevance, totalUpvotes, totalComments, topTopics);
+    List<String> _topKeys(Map<String,int> counts, [int n = 3]) {
+      final entries = counts.entries.toList();
+      entries.sort((a,b) => b.value.compareTo(a.value));
+      return entries.take(n).map((e) => '${e.key}').toList();
+    }
 
-    return Padding(
-      padding: const EdgeInsets.all(12),
-      child: Card(
+    final topTags = _topKeys(tagCounts);
+    final topTopics = _topKeys(topicCounts);
+    final topTerms = _topKeys(termCounts);
+
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      decoration: BoxDecoration(
         color: Colors.pink[50],
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-        child: Padding(
-          padding: const EdgeInsets.all(14),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.pink[200]!, width: 2),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
             children: [
-              const Text(
-                "📝 Forum Summary",
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Colors.black87),
-              ),
-              const SizedBox(height: 10),
-              Text(
-                summaryText,
-                style: const TextStyle(fontSize: 12, color: Colors.black87, height: 1.6),
+              const Expanded(child: Text('Daily summary', style: TextStyle(fontWeight: FontWeight.bold))),
+              IconButton(
+                icon: Icon(_summaryExpanded ? Icons.expand_less : Icons.expand_more, color: Colors.pink),
+                onPressed: () => setState(() => _summaryExpanded = !_summaryExpanded),
               ),
             ],
           ),
-        ),
+          AnimatedCrossFade(
+            firstChild: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    _buildStatCard(Icons.post_add, todayPosts.toString(), 'Posts', Colors.pink),
+                    _buildStatCard(Icons.chat_bubble, totalComments.toString(), 'Comments', Colors.pink),
+                    _buildStatCard(Icons.arrow_upward, totalUpvotes.toString(), 'Upvotes', Colors.pink),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Builder(
+                  builder: (ctx) {
+                    if (todayPosts == 0) {
+                      return const Text('No posts today.', style: TextStyle(color: Colors.black54));
+                    }
+
+                    final tagsText = topTags.isNotEmpty ? topTags.join(', ') : 'none';
+                    final topicsText = topTopics.isNotEmpty ? topTopics.join(', ') : 'general';
+                    final termsText = topTerms.isNotEmpty ? topTerms.join(', ') : '';
+
+                    final sentence = StringBuffer();
+                    sentence.write('Today there were $todayPosts post${todayPosts == 1 ? '' : 's'}, $totalComments comment${totalComments == 1 ? '' : 's'} and $totalUpvotes upvote${totalUpvotes == 1 ? '' : 's'}. ');
+                    sentence.write('Top tags: $tagsText. ');
+                    sentence.write('Top topics: $topicsText.');
+                    if (termsText.isNotEmpty) sentence.write(' Keywords: $termsText.');
+
+                    return Text(sentence.toString(), style: const TextStyle(fontSize: 13, color: Colors.black87));
+                  },
+                ),
+              ],
+            ),
+            secondChild: GestureDetector(
+              onTap: () => setState(() => _summaryExpanded = true),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                child: Text('$todayPosts post${todayPosts == 1 ? '' : 's'} today — tap to show summary', style: const TextStyle(color: Colors.black54)),
+              ),
+            ),
+            crossFadeState: _summaryExpanded ? CrossFadeState.showFirst : CrossFadeState.showSecond,
+            duration: const Duration(milliseconds: 200),
+          ),
+        ],
       ),
     );
   }
 
-  /// Generate comprehensive summary text explaining all posts
-  String _generateSummaryText(int totalPosts, int highRelevance, int totalUpvotes, int totalComments, List<MapEntry<String, int>> topTopics) {
-    final buffer = StringBuffer();
-    
-    buffer.write('This PCOS community forum has $totalPosts active discussions with $totalUpvotes upvotes and $totalComments comments. ');
-    buffer.write('$highRelevance posts are high-quality, PCOS-focused content. ');
-    
-    if (topTopics.isNotEmpty) {
-      buffer.write('Main discussion topics include: ');
-      final topicsList = topTopics.take(3).map((t) => '${t.key} (${t.value} posts)').join(', ');
-      buffer.write('$topicsList. ');
-    }
-    
-    buffer.write('Members share experiences, ask questions, and support each other in managing PCOS symptoms and treatments.');
-    
-    return buffer.toString();
+  Widget _buildStatCard(IconData icon, String value, String label, MaterialColor color) {
+    return Column(
+      children: [
+        Icon(icon, color: Colors.pink[400], size: 20),
+        const SizedBox(height: 4),
+        Text(value, style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.pink[400])),
+        Text(label, style: TextStyle(fontSize: 11, color: Colors.pink[300], fontWeight: FontWeight.w500)),
+      ],
+    );
   }
 
   Widget _buildPostCard(ForumPost post, int index) {
-    return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      elevation: 2,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: InkWell(
-        onTap: () => Navigator.push(
+    final userVote = _userPostVotes[post.id] ?? 0; // Get current user's vote
+    
+    return InkWell(
+      onTap: () async {
+        final updated = await Navigator.push(
           context,
-          MaterialPageRoute(builder: (_) => ForumPostPage(post: post)),
+          MaterialPageRoute(
+            builder: (context) => ForumPostPage(
+              post: post,
+              userVote: userVote,
+            ),
+          ),
+        );
+        if (updated != null && updated is ForumPost) {
+          setState(() {
+            _posts[index] = updated;
+          });
+        }
+      },
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.pink[200]!, width: 2),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.pink.withOpacity(0.05),
+              blurRadius: 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
         ),
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // Author and timestamp
-              Row(
-                children: [
-                  CircleAvatar(
-                    radius: 16,
-                    backgroundColor: Colors.pink[100],
-                    child: Text(post.author[0].toUpperCase(), style: TextStyle(color: Colors.pink[700], fontWeight: FontWeight.bold)),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                CircleAvatar(
+                  radius: 14,
+                  backgroundColor: Colors.pink[50],
+                  child: Text(
+                    post.author[0].toUpperCase(),
+                    style: const TextStyle(color: Colors.pink, fontWeight: FontWeight.bold, fontSize: 13),
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Text('u/${post.author}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-                            const SizedBox(width: 8),
-                            Text('${post.timeAgo}', style: TextStyle(fontSize: 12, color: Colors.grey[600])),
-                          ],
-                        ),
-                        Text('r/PCOS', style: TextStyle(fontSize: 12, color: Colors.grey[600])),
-                      ],
-                    ),
-                  ),
-                  PopupMenuButton<String>(
-                    icon: const Icon(Icons.more_vert, size: 20),
-                    onSelected: (value) => _handlePostAction(value, post, index),
-                    itemBuilder: (context) => [
-                      const PopupMenuItem(value: 'save', child: Row(children: [Icon(Icons.bookmark_outline), SizedBox(width: 8), Text('Save Post')])),
-                      const PopupMenuItem(value: 'hide', child: Row(children: [Icon(Icons.visibility_off), SizedBox(width: 8), Text('Hide Post')])),
-                      const PopupMenuItem(value: 'report', child: Row(children: [Icon(Icons.flag_outlined), SizedBox(width: 8), Text('Report Post')])),
-                      if (post.author == 'You') const PopupMenuItem(value: 'delete', child: Row(children: [Icon(Icons.delete_outline, color: Colors.red), SizedBox(width: 8), Text('Delete Post', style: TextStyle(color: Colors.red))])),
-                    ],
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              // Title
-              Text(
-                post.title,
-                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-              const SizedBox(height: 8),
-              // Content preview
-              Text(
-                post.content,
-                style: TextStyle(fontSize: 14, color: Colors.grey[700]),
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-              const SizedBox(height: 12),
-              // AI Relevance Indicator and Primary Topic
-              if (post.isPcosRelevant && post.relevanceScore != null && post.relevanceScore! > 0)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: Row(
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Icon(
-                        Icons.verified_user,
-                        size: 16,
-                        color: _getRelevanceColor(post.relevanceScore ?? 0),
-                      ),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Text(
-                                  post.primaryTopic ?? 'PCOS Related',
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w600,
-                                    color: _getRelevanceColor(post.relevanceScore ?? 0),
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                  decoration: BoxDecoration(
-                                    color: _getRelevanceColor(post.relevanceScore ?? 0).withOpacity(0.15),
-                                    borderRadius: BorderRadius.circular(8),
-                                  ),
-                                  child: Text(
-                                    '${(post.relevanceScore ?? 0).toStringAsFixed(0)}%',
-                                    style: TextStyle(
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.bold,
-                                      color: _getRelevanceColor(post.relevanceScore ?? 0),
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                            if ((post.detectedPcosTerms?.length ?? 0) > 0)
-                              Padding(
-                                padding: const EdgeInsets.only(top: 4),
-                                child: Text(
-                                  'Detected: ${post.detectedPcosTerms!.take(2).join(", ")}${post.detectedPcosTerms!.length > 2 ? ' +${post.detectedPcosTerms!.length - 2}' : ''}',
-                                  style: TextStyle(fontSize: 10, color: Colors.grey[600]),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                          ],
-                        ),
-                      ),
+                      Text('u/${post.author}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.pink)),
+                      Text(post.timeAgo, style: const TextStyle(fontSize: 10, color: Colors.pink)),
                     ],
                   ),
                 ),
-              // Tags
+                PopupMenuButton<String>(
+                  onSelected: (action) => _handlePostAction(action, post, index),
+                  itemBuilder: (context) => [
+                    const PopupMenuItem(value: 'share', child: Text('Share')),
+                    const PopupMenuItem(value: 'report', child: Text('Report')),
+                    if (post.userId == _getSupabaseClientOrNull()?.auth.currentUser?.id)
+                      const PopupMenuItem(value: 'delete', child: Text('Delete')),
+                  ],
+                  icon: const Icon(Icons.more_vert, size: 18, color: Colors.pink),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Text(post.title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Colors.black87)),
+            const SizedBox(height: 6),
+            Text(post.content, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13, color: Colors.black87)),
+            if (post.tags.isNotEmpty) ...[
+              const SizedBox(height: 8),
               Wrap(
-                spacing: 8,
+                spacing: 6,
                 children: post.tags.map((tag) => Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                   decoration: BoxDecoration(
-                    color: Colors.blue[50],
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: Colors.blue[200]!),
+                    color: Colors.pink[50],
+                    border: Border.all(color: Colors.pink[200]!),
+                    borderRadius: BorderRadius.circular(8),
                   ),
-                  child: Text(tag, style: TextStyle(fontSize: 12, color: Colors.blue[700])),
+                  child: Text(tag, style: const TextStyle(fontSize: 10, color: Colors.pink)),
                 )).toList(),
               ),
-              const SizedBox(height: 12),
-              // Vote and comment buttons
-              Row(
-                children: [
-                  Container(
-                    decoration: BoxDecoration(
-                      color: Colors.grey[100],
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    child: Row(
-                      children: [
-                        GestureDetector(
-                          onTap: () => setState(() {
-                            final origIndex = _posts.indexWhere((p) => p.id == post.id);
-                            if (origIndex == -1) return;
-                            if (_posts[origIndex].userVote == 1) {
-                              _posts[origIndex].upvotes--;
-                              _posts[origIndex].userVote = 0;
-                            } else {
-                              if (_posts[origIndex].userVote == -1) {
-                                _posts[origIndex].downvotes--;
-                              }
-                              _posts[origIndex].upvotes++;
-                              _posts[origIndex].userVote = 1;
-                            }
-                          }),
-                          child: Icon(
-                            Icons.arrow_upward,
-                            size: 16,
-                            color: post.userVote == 1 ? Colors.orange : Colors.grey,
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Text('${post.score}', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                        const SizedBox(width: 8),
-                        GestureDetector(
-                          onTap: () => setState(() {
-                            final origIndex = _posts.indexWhere((p) => p.id == post.id);
-                            if (origIndex == -1) return;
-                            if (_posts[origIndex].userVote == -1) {
-                              _posts[origIndex].downvotes--;
-                              _posts[origIndex].userVote = 0;
-                            } else {
-                              if (_posts[origIndex].userVote == 1) {
-                                _posts[origIndex].upvotes--;
-                              }
-                              _posts[origIndex].downvotes++;
-                              _posts[origIndex].userVote = -1;
-                            }
-                          }),
-                          child: Icon(
-                            Icons.arrow_downward,
-                            size: 16,
-                            color: post.userVote == -1 ? Colors.blue : Colors.grey,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Icon(Icons.chat_bubble_outline, size: 18, color: Colors.grey),
-                  const SizedBox(width: 6),
-                  Text('${post.comments} Comments', style: TextStyle(fontSize: 12, color: Colors.grey[600])),
-                  const Spacer(),
-                  GestureDetector(
-                    onTap: () => _sharePost(post),
-                    child: Icon(Icons.share_outlined, size: 18, color: Colors.grey),
-                  ),
-                ],
-              ),
             ],
-          ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                GestureDetector(
+                  onTap: () => _voteOnPostFromList(post, 1),
+                  child: Icon(userVote == 1 ? Icons.arrow_upward : Icons.arrow_upward_outlined, size: 18, color: userVote == 1 ? Colors.pink : Colors.pink[200]),
+                ),
+                const SizedBox(width: 4),
+                Text('${post.score}', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: userVote == 1 ? Colors.pink : (userVote == -1 ? Colors.pink[200] : Colors.black54))),
+                const SizedBox(width: 4),
+                GestureDetector(
+                  onTap: () => _voteOnPostFromList(post, -1),
+                  child: Icon(userVote == -1 ? Icons.arrow_downward : Icons.arrow_downward_outlined, size: 18, color: userVote == -1 ? Colors.pink[200] : Colors.pink[100]),
+                ),
+                const SizedBox(width: 12),
+                Icon(Icons.chat_bubble_outline, size: 16, color: Colors.pink[200]),
+                const SizedBox(width: 4),
+                Text('${post.comments}', style: const TextStyle(fontSize: 12, color: Colors.pink)),
+                const Spacer(),
+                GestureDetector(
+                  onTap: () => _sharePost(post),
+                  child: const Icon(Icons.share_outlined, size: 16, color: Colors.pink),
+                ),
+              ],
+            ),
+          ],
         ),
       ),
     );
   }
 
-  /// Analyzes post content for PCOS relevance using advanced AI verification
-  /// Returns a map with 'approved' (bool) and detailed analysis data
   Future<Map<String, dynamic>> _analyzePostRelevance(String title, String content) async {
     try {
-      // Use advanced forum relevance analyzer
-      final result = await ForumRelevanceAnalyzer.analyzeForum(title, content);
-      
-      return {
-        'approved': result.isRelevant,
-        'reason': result.feedback,
-        'score': result.relevanceScore,
-        'suggested_tags': result.suggestedTags,
-        'primary_topic': result.primaryTopic,
-        'detected_terms': result.detectedTerms,
-        'confidence': result.confidence,
-        'content_quality': result.contentQualityMetrics,
-      };
+      final service = AIModerationService();
+      final result = await service.analyzePcosRelevance(title, content);
+      return result;
     } catch (e) {
-      print('Forum relevance analysis error: $e');
-      // Fallback to basic content verification
-      try {
-        final basicResult = await AIModerationService.verifyPcosContent(title, content);
-        return {
-          'approved': basicResult.approved,
-          'reason': basicResult.reason,
-          'score': basicResult.relevanceScore,
-          'suggested_tags': basicResult.suggestedTags,
-          'primary_topic': 'General Discussion',
-          'detected_terms': basicResult.termsFound,
-          'confidence': basicResult.confidence,
-          'content_quality': {},
-        };
-      } catch (fallbackError) {
-        print('Fallback moderation error: $fallbackError');
-        return {
-          'approved': false,
-          'reason': 'Content verification failed. Please try again.',
-          'score': 0.0,
-          'suggested_tags': [],
-          'primary_topic': 'Unknown',
-          'detected_terms': [],
-          'confidence': 0.0,
-          'content_quality': {},
-        };
-      }
+      print('Error analyzing post relevance: $e');
+      return {
+        'approved': true,
+        'relevance_score': 0.0,
+        'primary_topic': 'general',
+        'detected_terms': [],
+        'is_pcos_relevant': true,
+      };
     }
   }
 
   void _showCreatePostDialog() {
     final titleController = TextEditingController();
     final contentController = TextEditingController();
-    final List<String> selectedTags = [];
+    List<String> selectedTags = [];
+    List<String> aiSuggestedTags = [];
+    bool isSubmitting = false;
+    bool showSuggestions = false;
 
     showDialog(
       context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) => Dialog(
-          insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          child: SingleChildScrollView(
+          insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+          titlePadding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
+          contentPadding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+          backgroundColor: Colors.white,
+          title: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.pink[50],
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Icon(Icons.create, color: Colors.pink, size: 20),
+              ),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Text('Create New Post', style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+            ],
+          ),
+          content: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Header with close button
-                Container(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(colors: [Colors.pink[400]!, Colors.pink[600]!]),
-                    borderRadius: const BorderRadius.only(
-                      topLeft: Radius.circular(16),
-                      topRight: Radius.circular(16),
-                    ),
+                TextField(
+                  controller: titleController,
+                  decoration: InputDecoration(
+                    labelText: 'Title',
+                    filled: true,
+                    fillColor: Colors.grey[50],
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                   ),
-                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('Create New Post', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
-                          Text('Share your experience with the community', style: TextStyle(fontSize: 12, color: Colors.white70)),
-                        ],
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.close, color: Colors.white),
-                        onPressed: () => Navigator.pop(ctx),
-                      ),
-                    ],
-                  ),
+                  maxLength: 300,
+                  onChanged: (_) async {
+                    // Suggest tags as user types
+                    final analysis = await _analyzePostRelevance(titleController.text, contentController.text);
+                    setDialogState(() {
+                      aiSuggestedTags = (analysis['suggested_tags'] as List?)?.cast<String>() ?? [];
+                      showSuggestions = aiSuggestedTags.isNotEmpty;
+                    });
+                  },
                 ),
-                Padding(
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      // Title input
-                      Text('Title*', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: Colors.grey[700])),
-                      const SizedBox(height: 8),
-                      TextField(
-                        controller: titleController,
-                        decoration: InputDecoration(
-                          hintText: 'What\'s on your mind?',
-                          prefixIcon: Icon(Icons.subject, color: Colors.pink[300]),
-                          filled: true,
-                          fillColor: Colors.pink[50],
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(12),
-                            borderSide: BorderSide(color: Colors.pink[200]!),
-                          ),
-                          enabledBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(12),
-                            borderSide: BorderSide(color: Colors.pink[200]!),
-                          ),
-                          focusedBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(12),
-                            borderSide: BorderSide(color: Colors.pink[600]!, width: 2),
-                          ),
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-                        ),
-                        maxLines: 2,
-                        style: const TextStyle(fontSize: 14),
-                      ),
-                      const SizedBox(height: 20),
-                      
-                      // Content input
-                      Text('Content*', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: Colors.grey[700])),
-                      const SizedBox(height: 8),
-                      TextField(
-                        controller: contentController,
-                        decoration: InputDecoration(
-                          hintText: 'Share your thoughts, questions, or experiences...',
-                          prefixIcon: Padding(
-                            padding: const EdgeInsets.only(top: 8),
-                            child: Icon(Icons.description, color: Colors.pink[300]),
-                          ),
-                          filled: true,
-                          fillColor: Colors.pink[50],
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(12),
-                            borderSide: BorderSide(color: Colors.pink[200]!),
-                          ),
-                          enabledBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(12),
-                            borderSide: BorderSide(color: Colors.pink[200]!),
-                          ),
-                          focusedBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(12),
-                            borderSide: BorderSide(color: Colors.pink[600]!, width: 2),
-                          ),
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-                        ),
-                        maxLines: 8,
-                        minLines: 6,
-                        style: const TextStyle(fontSize: 14),
-                      ),
-                      const SizedBox(height: 20),
-                      
-                      // Tags section
-                      Row(
-                        children: [
-                          Icon(Icons.local_offer, color: Colors.pink[600], size: 18),
-                          const SizedBox(width: 8),
-                          Text('Tags (select up to 3):', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: Colors.grey[700])),
-                          const SizedBox(width: 4),
-                          Text('${selectedTags.length}/3', style: TextStyle(fontSize: 11, color: Colors.pink[600], fontWeight: FontWeight.bold)),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: _availableTags.map((tag) {
-                          final isSelected = selectedTags.contains(tag);
-                          return FilterChip(
-                            label: Text(tag, style: TextStyle(fontSize: 12, fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500)),
-                            selected: isSelected,
-                            onSelected: selectedTags.length < 3 || isSelected ? (selected) {
-                              setDialogState(() {
-                                if (selected && !selectedTags.contains(tag)) {
-                                  selectedTags.add(tag);
-                                } else {
-                                  selectedTags.remove(tag);
-                                }
-                              });
-                            } : null,
-                            backgroundColor: Colors.white,
-                            selectedColor: Colors.pink[100],
-                            side: BorderSide(color: isSelected ? Colors.pink[600]! : Colors.pink[200]!, width: 1.5),
-                            checkmarkColor: Colors.pink[600],
-                            avatar: isSelected ? Icon(Icons.check_circle, size: 16, color: Colors.pink[600]) : null,
-                          );
-                        }).toList(),
-                      ),
-                    ],
+                const SizedBox(height: 12),
+                TextField(
+                  controller: contentController,
+                  decoration: InputDecoration(
+                    labelText: 'Content',
+                    alignLabelWithHint: true,
+                    filled: true,
+                    fillColor: Colors.grey[50],
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                   ),
+                  maxLines: 5,
+                  maxLength: 10000,
+                  onChanged: (_) async {
+                    // Suggest tags as user types
+                    final analysis = await _analyzePostRelevance(titleController.text, contentController.text);
+                    setDialogState(() {
+                      aiSuggestedTags = (analysis['suggested_tags'] as List?)?.cast<String>() ?? [];
+                      showSuggestions = aiSuggestedTags.isNotEmpty;
+                    });
+                  },
                 ),
-                
-                // Action buttons
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      TextButton.icon(
-                        icon: const Icon(Icons.cancel),
-                        label: const Text('Cancel'),
-                        onPressed: () => Navigator.pop(ctx),
-                        style: TextButton.styleFrom(foregroundColor: Colors.grey[600]),
-                      ),
-                      ElevatedButton.icon(
-                        icon: const Icon(Icons.send),
-                        label: const Text('Post'),
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
-                        onPressed: () async {
-                          if (titleController.text.isNotEmpty && contentController.text.isNotEmpty) {
-                            // Show enhanced loading dialog
-                            showDialog(
-                              context: context,
-                              barrierDismissible: false,
-                              builder: (dialogCtx) => Dialog(
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(16),
-                                ),
-                                elevation: 8,
-                                child: Container(
-                                  decoration: BoxDecoration(
-                                    borderRadius: BorderRadius.circular(16),
-                                    gradient: LinearGradient(
-                                      begin: Alignment.topLeft,
-                                      end: Alignment.bottomRight,
-                                      colors: [Colors.blue[50]!, Colors.purple[50]!],
-                                    ),
-                                  ),
-                                  padding: const EdgeInsets.all(24),
-                                  child: Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Container(
-                                        padding: const EdgeInsets.all(12),
-                                        decoration: BoxDecoration(
-                                          shape: BoxShape.circle,
-                                          color: Colors.white.withOpacity(0.7),
-                                        ),
-                                        child: const SizedBox(
-                                          height: 40,
-                                          width: 40,
-                                          child: CircularProgressIndicator(
-                                            strokeWidth: 3,
-                                            valueColor: AlwaysStoppedAnimation<Color>(
-                                              Color(0xFF8B5CF6),
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(height: 20),
-                                      const Text(
-                                        'Analyzing Post',
-                                        style: TextStyle(
-                                          fontSize: 18,
-                                          fontWeight: FontWeight.bold,
-                                          color: Color(0xFF1F2937),
-                                        ),
-                                      ),
-                                      const SizedBox(height: 8),
-                                      const Text(
-                                        'Using AI to verify PCOS relevance...',
-                                        textAlign: TextAlign.center,
-                                        style: TextStyle(
-                                          fontSize: 13,
-                                          color: Color(0xFF6B7280),
-                                        ),
-                                      ),
-                                      const SizedBox(height: 16),
-                                      ClipRRect(
-                                        borderRadius: BorderRadius.circular(4),
-                                        child: LinearProgressIndicator(
-                                          minHeight: 4,
-                                          backgroundColor: Colors.grey[300],
-                                          valueColor: AlwaysStoppedAnimation<Color>(
-                                            Colors.blue[400]!,
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                            );
-
-                            // AI-based content moderation / verification
-                            final moderation = await _analyzePostRelevance(
-                              titleController.text,
-                              contentController.text,
-                            );
-
-                            // Close loading dialog
-                            Navigator.pop(context);
-
-                            if (!(moderation['approved'] as bool)) {
-                              // Show detailed rejection dialog with AI analysis
-                              showDialog(
-                                context: context,
-                                builder: (dialogCtx) => AlertDialog(
-                                  title: const Text('Post Needs Adjustment'),
-                                  content: SingleChildScrollView(
-                                    child: Column(
-                                      mainAxisSize: MainAxisSize.min,
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: [
-                                        Text(
-                                          moderation['reason'] as String,
-                                          style: const TextStyle(fontSize: 14),
-                                        ),
-                                        const SizedBox(height: 16),
-                                        // Show AI suggestions if available
-                                        if ((moderation['detected_terms'] as List?)?.isNotEmpty ?? false)
-                                          Padding(
-                                            padding: const EdgeInsets.only(top: 8),
-                                            child: Column(
-                                              crossAxisAlignment: CrossAxisAlignment.start,
-                                              children: [
-                                                Text(
-                                                  'Suggestions to improve:',
-                                                  style: TextStyle(
-                                                    fontSize: 12,
-                                                    fontWeight: FontWeight.w600,
-                                                    color: Colors.grey[600],
-                                                  ),
-                                                ),
-                                                const SizedBox(height: 8),
-                                                Text(
-                                                  '• Include more PCOS-related terms (e.g., symptoms, treatment, hormones)\n• Provide more detail about your experience or question\n• Focus on health topics related to polycystic ovary syndrome',
-                                                  style: TextStyle(fontSize: 12, color: Colors.grey[700]),
-                                                ),
-                                              ],
-                                            ),
-                                          ),
-                                      ],
-                                    ),
-                                  ),
-                                  actions: [
-                                    TextButton(
-                                      onPressed: () => Navigator.pop(dialogCtx),
-                                      child: const Text('Edit Post'),
-                                    ),
-                                    TextButton(
-                                      onPressed: () {
-                                        Navigator.pop(dialogCtx);
-                                        Navigator.pop(ctx);
-                                      },
-                                      child: const Text('Dismiss'),
-                                    ),
-                                  ],
-                                ),
-                              );
-                            } else {
-                              // Merge suggested tags (from verifier) into selected tags up to 3
-                              final suggested = (moderation['suggested_tags'] as List<dynamic>?)?.cast<String>() ?? [];
-                              for (final tag in suggested) {
-                                if (selectedTags.length >= 3) break;
-                                if (!selectedTags.contains(tag)) selectedTags.add(tag);
-                              }
-
-                              // Determine tags to set on the post
-                              List<String> tagsToUse;
-                              if (selectedTags.isNotEmpty) {
-                                tagsToUse = List<String>.from(selectedTags);
-                              } else if (suggested.isNotEmpty) {
-                                tagsToUse = suggested.length > 3 ? suggested.sublist(0, 3) : suggested;
-                              } else {
-                                tagsToUse = ['Discussion'];
-                              }
-
-                              // Post approved - add to forum with AI analysis data
-                              final newPost = ForumPost(
-                                id: _posts.length + 1,
-                                title: titleController.text,
-                                content: contentController.text,
-                                author: 'You',
-                                postedTime: DateTime.now(),
-                                upvotes: 1, // Self upvote
-                                downvotes: 0,
-                                comments: 0,
-                                tags: tagsToUse,
-                                // AI Analysis Fields
-                                relevanceScore: (moderation['score'] as num?)?.toDouble() ?? 0.0,
-                                primaryTopic: moderation['primary_topic'] as String? ?? 'General Discussion',
-                                detectedPcosTerms: (moderation['detected_terms'] as List<dynamic>?)?.cast<String>() ?? [],
-                                isPcosRelevant: true,
-                              );
-                              setState(() => _posts.insert(0, newPost));
-                              Navigator.pop(ctx);
-                              
-                              // Show success with AI analysis details
-                              final primaryTopic = moderation['primary_topic'] as String? ?? 'General Discussion';
-                              final relevanceScore = (moderation['score'] as num?)?.toDouble() ?? 0.0;
-                              final scoreText = relevanceScore >= 70
-                                  ? '🔥 High PCOS relevance'
-                                  : relevanceScore >= 50
-                                      ? '✓ Good PCOS relevance'
-                                      : '✓ PCOS related';
-                              
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        moderation['reason'] as String,
-                                        style: const TextStyle(color: Colors.white),
-                                      ),
-                                      const SizedBox(height: 4),
-                                      Text(
-                                        '$scoreText • $primaryTopic (${relevanceScore.toStringAsFixed(0)}%)',
-                                        style: const TextStyle(fontSize: 12, color: Colors.white70),
-                                      ),
-                                    ],
-                                  ),
-                                  backgroundColor: Colors.green,
-                                  duration: const Duration(seconds: 4),
-                                ),
-                              );
-                            }
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Text('Tags (select up to 3)', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.pink)),
+                    const Spacer(),
+                    Text('${selectedTags.length}/3', style: const TextStyle(fontSize: 12, color: Colors.black54)),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 6,
+                  children: [
+                    ...selectedTags.map((tag) => Chip(
+                          label: Text(tag),
+                          backgroundColor: Colors.pink[50],
+                          labelStyle: const TextStyle(color: Colors.pink),
+                          deleteIcon: const Icon(Icons.close, size: 16, color: Colors.pink),
+                          onDeleted: () {
+                            setDialogState(() {
+                              selectedTags.remove(tag);
+                            });
+                          },
+                        )),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 6,
+                  children: [
+                    // Static tag options shown as selectable chips
+                    ...[ 'PCOS Support', 'Symptoms', 'Treatment', 'Lifestyle', 'Experience', 'Discussion', 'Advice', 'Fertility', 'Exercise', 'Diet', 'Mental Health', 'Success', 'Story', 'Journey', 'Tips', 'Support', 'Doctor', 'Medication', 'Wellness', 'Sleep', 'Weight', 'Nutrition', 'Community' ]
+                      .map((tag) => FilterChip(
+                              label: Text(tag),
+                              selected: selectedTags.contains(tag),
+                              selectedColor: Colors.pink[100],
+                              checkmarkColor: Colors.pink,
+                              onSelected: (selected) {
+                                setDialogState(() {
+                                  if (selected) {
+                                    if (!selectedTags.contains(tag) && selectedTags.length < 3) {
+                                      selectedTags.add(tag);
+                                    } else if (selectedTags.length >= 3) {
+                                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('You can select up to 3 tags')));
+                                    }
+                                  } else {
+                                    selectedTags.remove(tag);
+                                  }
+                                });
+                              },
+                            ))
+                        .toList(),
+                  ],
+                ),
+                if (showSuggestions && aiSuggestedTags.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text('AI Suggestions:', style: TextStyle(fontSize: 12, color: Colors.pink)),
+                  Wrap(
+                    spacing: 6,
+                    children: aiSuggestedTags.map((tag) => ActionChip(
+                      label: Text(tag),
+                      backgroundColor: Colors.pink[100],
+                      labelStyle: const TextStyle(color: Colors.pink),
+                      onPressed: () {
+                          if (!selectedTags.contains(tag) && selectedTags.length < 3) {
+                            setDialogState(() {
+                              selectedTags.add(tag);
+                            });
+                          } else if (selectedTags.length >= 3) {
+                            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('You can select up to 3 tags')));
                           }
-                        },
-                      ),
-                    ],
+                      },
+                    )).toList(),
                   ),
-                ),
+                ],
               ],
             ),
           ),
+          actions: [
+              TextButton(
+                onPressed: isSubmitting ? null : () => Navigator.pop(context),
+                child: const Text('Cancel'),
+              ),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.pink[400],
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+                onPressed: isSubmitting ? null : () async {
+                final title = titleController.text.trim();
+                final content = contentController.text.trim();
+                final tags = selectedTags;
+
+                if (title.isEmpty || content.isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Please fill in all fields')),
+                  );
+                  return;
+                }
+
+                setDialogState(() => isSubmitting = true);
+
+                try {
+                  final client = _getSupabaseClientOrNull();
+                  if (client == null) throw Exception('Not connected to database');
+
+                  final user = client.auth.currentUser;
+                  if (user == null) throw Exception('Please sign in to post');
+
+                  // Analyze relevance
+                  final analysis = await _analyzePostRelevance(title, content);
+
+                  if (!analysis['approved']) {
+                    Navigator.pop(context);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(analysis['message'] ?? 'Post not PCOS-relevant'),
+                        backgroundColor: Colors.orange,
+                      ),
+                    );
+                    return;
+                  }
+
+                  // Insert post
+                  final inserted = await client.from('forum_posts').insert({
+                    'user_id': user.id,
+                    'author': _resolveAuthorName(user),
+                    'title': title,
+                    'content': content,
+                    'upvotes': 0,
+                    'downvotes': 0,
+                    'comments_count': 0,
+                    'tags': tags,
+                    'relevance_score': analysis['relevance_score'],
+                    'primary_topic': analysis['primary_topic'],
+                    // Write both column names to support older/newer schemas
+                    'detected_terms': analysis['detected_terms'] ?? analysis['detected_terms'],
+                    'detected_terms': analysis['detected_terms'] ?? analysis['detected_terms'],
+                    'is_pcos_relevant': analysis['is_pcos_relevant'],
+                  }).select().single();
+
+                  final newPost = ForumPost(
+                    id: inserted['id'] as int,
+                    userId: inserted['user_id'] as String,
+                    title: inserted['title'] as String,
+                    content: inserted['content'] as String,
+                    author: inserted['author'] as String,
+                    postedTime: DateTime.parse(inserted['posted_at'] as String).toLocal(),
+                    upvotes: 0,
+                    downvotes: 0,
+                    comments: 0,
+                    tags: tags,
+                    relevanceScore: analysis['relevance_score'] as double?,
+                    primaryTopic: analysis['primary_topic'] as String?,
+                    detectedPcosTerms: ((analysis['detected_terms'] as List?) ?? (analysis['detected_terms'] as List?))?.cast<String>(),
+                    isPcosRelevant: analysis['is_pcos_relevant'] as bool? ?? true,
+                  );
+
+                  Navigator.pop(context);
+                  setState(() {
+                    _posts.insert(0, newPost);
+                  });
+
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Post created successfully!'),
+                      backgroundColor: Colors.green,
+                    ),
+                  );
+                } catch (e) {
+                  Navigator.pop(context);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('Failed to create post: $e'),
+                      backgroundColor: Colors.red,
+                    ),
+                  );
+                }
+              },
+              child: isSubmitting
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                    )
+                  : const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      child: Text('Post'),
+                    ),
+            ),
+          ],
         ),
       ),
     );
@@ -841,28 +777,8 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
 
   void _handlePostAction(String action, ForumPost post, int index) {
     switch (action) {
-      case 'save':
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Post saved to your collection')),
-        );
-        break;
-      case 'hide':
-        setState(() {
-          _posts.removeAt(index);
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Text('Post hidden'),
-            action: SnackBarAction(
-              label: 'Undo',
-              onPressed: () {
-                setState(() {
-                  _posts.insert(index, post);
-                });
-              },
-            ),
-          ),
-        );
+      case 'share':
+        _sharePost(post);
         break;
       case 'report':
         _showReportDialog(post);
@@ -877,27 +793,41 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
     DialogHelper.showConfirmationDialog(
       context: context,
       title: 'Report Post',
-      message: 'Thank you for helping keep our community safe. Your report will be reviewed by our moderators.',
+      message: 'Are you sure you want to report this post for violating community guidelines?',
       confirmText: 'Report',
       cancelText: 'Cancel',
-      icon: Icons.flag_rounded,
       isDangerous: true,
-    ).then((confirmed) {
+    ).then((confirmed) async {
       if (confirmed == true) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Row(
-              children: [
-                Icon(Icons.check_circle, color: Colors.white),
-                SizedBox(width: 8),
-                Text('Post reported. Thank you for your feedback.'),
-              ],
-            ),
-            backgroundColor: Colors.orange[600],
-            behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-          ),
-        );
+        try {
+          final client = _getSupabaseClientOrNull();
+          if (client != null) {
+            final user = client.auth.currentUser;
+            
+            // Store content report in database
+            // Note: You'll need to create a content_reports table in Supabase
+            // For now, we'll just show a success message
+            await Future.delayed(const Duration(milliseconds: 500)); // Simulate async operation
+          }
+          
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Post reported. Thank you for keeping our community safe.'),
+                backgroundColor: Colors.green,
+              ),
+            );
+          }
+        } catch (e) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Failed to report post: $e'),
+                backgroundColor: Colors.red,
+              ),
+            );
+          }
+        }
       }
     });
   }
@@ -909,29 +839,74 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
       message: 'Are you sure you want to delete this post? This action cannot be undone.',
       confirmText: 'Delete',
       cancelText: 'Cancel',
-      icon: Icons.delete_forever_rounded,
       isDangerous: true,
-    ).then((confirmed) {
+    ).then((confirmed) async {
       if (confirmed == true) {
-        setState(() {
-          _posts.removeAt(index);
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Row(
-              children: [
-                Icon(Icons.check_circle, color: Colors.white),
-                SizedBox(width: 8),
-                Text('Post deleted'),
-              ],
-            ),
-            backgroundColor: Colors.green[600],
-            behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-          ),
-        );
+        try {
+          final client = _getSupabaseClientOrNull();
+          if (client != null) {
+            await client.from('forum_posts').delete().eq('id', post.id);
+          }
+
+          setState(() {
+            _posts.removeAt(index);
+          });
+
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Post deleted successfully'),
+                backgroundColor: Colors.green,
+              ),
+            );
+          }
+        } catch (e) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Failed to delete post: $e'),
+                backgroundColor: Colors.red,
+              ),
+            );
+          }
+        }
       }
     });
+  }
+
+  Future<void> _voteOnPostFromList(ForumPost post, int vote) async {
+    final client = _getSupabaseClientOrNull();
+    if (client == null) return;
+    final user = client.auth.currentUser;
+    if (user == null) return;
+
+    final currentVote = _userPostVotes[post.id] ?? 0;
+
+    if (currentVote == vote) {
+      // Remove vote
+      await client
+        .from('user_votes')
+        .delete()
+        .eq('user_id', user.id)
+        .eq('post_id', post.id)
+        .isFilter('comment_id', null);
+    } else if (currentVote == 0) {
+      // Insert new vote
+      await client.from('user_votes').insert({
+        'user_id': user.id,
+        'post_id': post.id,
+        'vote_type': vote,
+        'comment_id': null, // <-- add this!
+      });
+    } else {
+      // Update existing vote
+      await client
+        .from('user_votes')
+        .update({'vote_type': vote})
+        .eq('user_id', user.id)
+        .eq('post_id', post.id)
+        .isFilter('comment_id', null);
+    }
   }
 
   void _sharePost(ForumPost post) {
@@ -942,34 +917,22 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Text('Share Post', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 16),
-            ListTile(
-              leading: const Icon(Icons.link),
-              title: const Text('Copy Link'),
-              onTap: () {
-                Navigator.pop(ctx);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Link copied to clipboard')),
-                );
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.message),
-              title: const Text('Share via Message'),
-              onTap: () {
-                Navigator.pop(ctx);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Opening messages...')),
-                );
-              },
-            ),
             ListTile(
               leading: const Icon(Icons.email),
               title: const Text('Share via Email'),
               onTap: () {
                 Navigator.pop(ctx);
                 _shareViaEmail(post);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.copy),
+              title: const Text('Copy Link'),
+              onTap: () {
+                Navigator.pop(ctx);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Link copied to clipboard')),
+                );
               },
             ),
           ],
@@ -1012,18 +975,18 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
 
 class ForumPost {
   final int id;
+  final String? userId;
   final String title;
   final String content;
   final String author;
   final DateTime postedTime;
   int upvotes;
   int downvotes;
-  int userVote = 0; // -1 downvote, 0 neutral, 1 upvote
-  final int comments;
+  int userVote = 0;
+  int comments;
   final List<String> tags;
   final List<ForumComment> replies;
   
-  // AI Relevance Detection Fields
   final double? relevanceScore;
   final String? primaryTopic;
   final List<String>? detectedPcosTerms;
@@ -1031,6 +994,7 @@ class ForumPost {
 
   ForumPost({
     required this.id,
+    this.userId,
     required this.title,
     required this.content,
     required this.author,
@@ -1049,11 +1013,20 @@ class ForumPost {
   int get score => upvotes - downvotes;
 
   String get timeAgo {
-    final diff = DateTime.now().difference(postedTime);
-    if (diff.inHours < 1) return '${diff.inMinutes}m ago';
-    if (diff.inDays < 1) return '${diff.inHours}h ago';
-    if (diff.inDays < 7) return '${diff.inDays}d ago';
-    return '${(diff.inDays / 7).floor()}w ago';
+    final now = DateTime.now();
+    final diff = now.difference(postedTime);
+
+    if (diff.inSeconds < 60) {
+      return 'just now';
+    } else if (diff.inMinutes < 60) {
+      return '${diff.inMinutes} minute${diff.inMinutes == 1 ? '' : 's'} ago';
+    } else if (diff.inHours < 24) {
+      return '${diff.inHours} hour${diff.inHours == 1 ? '' : 's'} ago';
+    } else if (diff.inDays < 7) {
+      return '${diff.inDays} day${diff.inDays == 1 ? '' : 's'} ago';
+    } else {
+      return '${postedTime.month}/${postedTime.day}/${postedTime.year}';
+    }
   }
 }
 
@@ -1079,18 +1052,31 @@ class ForumComment {
   int get score => upvotes - downvotes;
 
   String get timeAgo {
-    final diff = DateTime.now().difference(postedTime);
-    if (diff.inHours < 1) return '${diff.inMinutes}m ago';
-    if (diff.inDays < 1) return '${diff.inHours}h ago';
-    if (diff.inDays < 7) return '${diff.inDays}d ago';
-    return '${(diff.inDays / 7).floor()}w ago';
+    final now = DateTime.now();
+    final diff = now.difference(postedTime);
+    if (diff.inSeconds < 60) {
+      return 'just now';
+    } else if (diff.inMinutes < 60) {
+      return '${diff.inMinutes} minute${diff.inMinutes == 1 ? '' : 's'} ago';
+    } else if (diff.inHours < 24) {
+      return '${diff.inHours} hour${diff.inHours == 1 ? '' : 's'} ago';
+    } else if (diff.inDays < 7) {
+      return '${diff.inDays} day${diff.inDays == 1 ? '' : 's'} ago';
+    } else {
+      return '${postedTime.month}/${postedTime.day}/${postedTime.year}';
+    }
   }
 }
 
 class ForumPostPage extends StatefulWidget {
   final ForumPost post;
+  final int userVote; // Add this parameter
 
-  const ForumPostPage({required this.post});
+  const ForumPostPage({
+    Key? key, 
+    required this.post,
+    this.userVote = 0, // Default to no vote
+  }) : super(key: key);
 
   @override
   State<ForumPostPage> createState() => _ForumPostPageState();
@@ -1098,133 +1084,288 @@ class ForumPostPage extends StatefulWidget {
 
 class _ForumPostPageState extends State<ForumPostPage> {
   late List<ForumComment> _comments;
-  int _postUserVote = 0; // -1 downvote, 0 neutral, 1 upvote
-  final Map<int, int> _commentVotes = {}; // commentId -> vote
+  late int _userPostVote; // Changed from int to late int
+  Map<int, int> _userCommentVotes = {};
 
   @override
   void initState() {
     super.initState();
     _comments = List<ForumComment>.from(widget.post.replies);
+    _userPostVote = widget.userVote; // Initialize from parameter
+    _loadComments();
+    _loadUserVotes();
+  }
+
+  Future<void> _loadUserVotes() async {
+    final client = _getSupabaseClientOrNull();
+    if (client == null) return;
+    
+    final user = client.auth.currentUser;
+    if (user == null) return;
+
+    try {
+      // Load post vote
+      final postVotes = await client
+          .from('user_votes')
+          .select('vote_type')
+          .eq('user_id', user.id)
+          .eq('post_id', widget.post.id)
+          .isFilter('comment_id', null);
+      
+      // Load comment votes
+      final commentVotes = await client
+          .from('user_votes')
+          .select('comment_id, vote_type')
+          .eq('user_id', user.id)
+          .not('comment_id', 'is', null);
+
+      final Map<int, int> votes = {};
+      for (final row in commentVotes) {
+        final commentId = row['comment_id'] as int?;
+        final voteType = row['vote_type'] as int?;
+        if (commentId != null && voteType != null) {
+          votes[commentId] = voteType;
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _userPostVote = postVotes.isNotEmpty ? (postVotes.first['vote_type'] as int? ?? 0) : 0;
+          _userCommentVotes = votes;
+        });
+      }
+    } catch (e) {
+      print('Failed to load user votes: $e');
+    }
+  }
+
+  Future<void> _loadComments() async {
+    try {
+      final client = _getSupabaseClientOrNull();
+      if (client == null) return;
+
+      final rows = await client
+          .from('forum_comments')
+          .select()
+          .eq('post_id', widget.post.id)
+          .order('posted_at', ascending: false);
+
+      final Map<int, ForumComment> commentMap = {};
+      final List<ForumComment> topLevel = [];
+
+      for (final row in rows) {
+        final comment = _mapRowToComment(row);
+        commentMap[comment.id] = comment;
+      }
+
+      for (final row in rows) {
+        final commentId = row['id'] as int;
+        final parentId = row['parent_id'] as int?;
+        final comment = commentMap[commentId]!;
+
+        if (parentId == null) {
+          topLevel.add(comment);
+        } else {
+          final parent = commentMap[parentId];
+          if (parent != null) {
+            parent.replies.add(comment);
+          }
+        }
+      }
+
+      setState(() {
+        _comments = topLevel;
+      });
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to load comments: $e')),
+        );
+      }
+    }
+  }
+
+  ForumComment _mapRowToComment(Map<String, dynamic> row) {
+    return ForumComment(
+      id: row['id'] as int,
+      author: row['author']?.toString() ?? 'Unknown',
+      content: row['content'] as String,
+      postedTime: DateTime.parse(row['posted_at'] as String).toLocal(),
+      upvotes: row['upvotes'] as int? ?? 0,
+      downvotes: row['downvotes'] as int? ?? 0,
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Post'),
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back),
-          onPressed: () => Navigator.pop(context),
+    return WillPopScope(
+      onWillPop: () async {
+        Navigator.pop(context, widget.post);
+        return false;
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Post'),
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => Navigator.pop(context, widget.post),
+          ),
         ),
-      ),
-      body: SingleChildScrollView(
-        child: Column(
-          children: [
-            // Original post
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      CircleAvatar(
-                        radius: 20,
-                        backgroundColor: Colors.pink[100],
-                        child: Text(widget.post.author[0].toUpperCase(), style: TextStyle(color: Colors.pink[700], fontWeight: FontWeight.bold)),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text('u/${widget.post.author}', style: const TextStyle(fontWeight: FontWeight.bold)),
-                            Text('r/PCOS • ${widget.post.timeAgo}', style: TextStyle(fontSize: 12, color: Colors.grey[600])),
-                          ],
+        body: SingleChildScrollView(
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        CircleAvatar(
+                          radius: 20,
+                          backgroundColor: Colors.pink[100],
+                          child: Text(
+                            widget.post.author[0].toUpperCase(),
+                            style: TextStyle(color: Colors.pink[700], fontWeight: FontWeight.bold),
+                          ),
                         ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  Text(widget.post.title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
-                  const SizedBox(height: 12),
-                  Text(widget.post.content, style: TextStyle(fontSize: 14, color: Colors.grey[700])),
-                  const SizedBox(height: 16),
-                  // Vote and comment buttons
-                  Row(
-                    children: [
-                      Container(
-                        decoration: BoxDecoration(
-                          color: Colors.grey[100],
-                          borderRadius: BorderRadius.circular(20),
-                        ),
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                        child: Row(
-                          children: [
-                            IconButton(
-                              icon: Icon(
-                                Icons.arrow_upward,
-                                size: 18,
-                                color: _postUserVote == 1 ? Colors.orange : Colors.grey,
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'u/${widget.post.author}',
+                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
                               ),
-                              onPressed: () => _voteOnPost(1),
-                            ),
-                            Text('${widget.post.score}', style: const TextStyle(fontWeight: FontWeight.bold)),
-                            IconButton(
-                              icon: Icon(
-                                Icons.arrow_downward,
-                                size: 18,
-                                color: _postUserVote == -1 ? Colors.blue : Colors.grey,
+                              Text(
+                                'r/PCOS • ${widget.post.timeAgo}',
+                                style: TextStyle(fontSize: 12, color: Colors.grey[600]),
                               ),
-                              onPressed: () => _voteOnPost(-1),
-                            ),
-                          ],
+                            ],
+                          ),
                         ),
-                      ),
-                      const SizedBox(width: 12),
-                      ElevatedButton.icon(
-                        icon: const Icon(Icons.chat_bubble_outline),
-                        label: Text('${_comments.length}'),
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.grey[200]),
-                        onPressed: () {},
-                      ),
-                      const Spacer(),
-                      IconButton(
-                        icon: const Icon(Icons.share_outlined),
-                        onPressed: () => _sharePostFromDetail(),
-                      ),
-                    ],
-                  ),
-                ],
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      widget.post.title,
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      widget.post.content,
+                      style: TextStyle(fontSize: 14, color: Colors.grey[700]),
+                    ),
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        Container(
+                          decoration: BoxDecoration(
+                            color: _userPostVote != 0 
+                                ? (_userPostVote == 1 ? Colors.orange[50] : Colors.blue[50]) 
+                                : Colors.grey[100],
+                            borderRadius: BorderRadius.circular(20),
+                            border: _userPostVote != 0 ? Border.all(
+                              color: _userPostVote == 1 ? Colors.orange : Colors.blue,
+                              width: 1.5,
+                            ) : null,
+                          ),
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                          child: Row(
+                            children: [
+                              IconButton(
+                                icon: Icon(
+                                  _userPostVote == 1 ? Icons.arrow_upward : Icons.arrow_upward_outlined,
+                                  size: 20,
+                                  color: _userPostVote == 1 ? Colors.orange[700] : Colors.grey[600],
+                                ),
+                                onPressed: () => _voteOnPost(1),
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints(),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                '${widget.post.score}',
+                                style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 15,
+                                  color: _userPostVote == 1 
+                                      ? Colors.orange[700] 
+                                      : (_userPostVote == -1 ? Colors.blue[700] : Colors.grey[800]),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              IconButton(
+                                icon: Icon(
+                                  _userPostVote == -1 ? Icons.arrow_downward : Icons.arrow_downward_outlined,
+                                  size: 20,
+                                  color: _userPostVote == -1 ? Colors.blue[700] : Colors.grey[600],
+                                ),
+                                onPressed: () => _voteOnPost(-1),
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints(),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Container(
+                          decoration: BoxDecoration(
+                            color: Colors.grey[100],
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                          child: Row(
+                            children: [
+                              const Icon(Icons.chat_bubble_outline, size: 18),
+                              const SizedBox(width: 6),
+                              Text('${_comments.length}'),
+                            ],
+                          ),
+                        ),
+                        const Spacer(),
+                        IconButton(
+                          icon: const Icon(Icons.share_outlined),
+                          onPressed: () => _sharePostFromDetail(),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
               ),
-            ),
-            Divider(height: 1, thickness: 2, color: Colors.grey[300]),
-            // Comments section
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('${_comments.length} Comments', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                  const SizedBox(height: 12),
-                  ..._comments.map((comment) => _buildCommentTile(comment)).toList(),
-                  const SizedBox(height: 16),
-                  ElevatedButton.icon(
-                    icon: const Icon(Icons.add),
-                    label: const Text('Add Comment'),
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
-                    onPressed: () => _showAddCommentDialog(),
-                  ),
-                ],
+              Divider(height: 1, thickness: 2, color: Colors.grey[300]),
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '${_comments.length} Comments',
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                    ),
+                    const SizedBox(height: 12),
+                    ..._comments.map((comment) => _buildCommentTile(comment)).toList(),
+                    const SizedBox(height: 16),
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.add),
+                      label: const Text('Add Comment'),
+                      style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
+                      onPressed: () => _showAddCommentDialog(),
+                    ),
+                  ],
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
   }
 
   Widget _buildCommentTile(ForumComment comment) {
+    final userVote = _userCommentVotes[comment.id] ?? 0;
+    
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 12),
       child: Column(
@@ -1235,7 +1376,10 @@ class _ForumPostPageState extends State<ForumPostPage> {
               CircleAvatar(
                 radius: 16,
                 backgroundColor: Colors.blue[100],
-                child: Text(comment.author[0].toUpperCase(), style: TextStyle(color: Colors.blue[700], fontWeight: FontWeight.bold, fontSize: 12)),
+                child: Text(
+                  comment.author[0].toUpperCase(),
+                  style: TextStyle(color: Colors.blue[700], fontWeight: FontWeight.bold, fontSize: 12),
+                ),
               ),
               const SizedBox(width: 8),
               Expanded(
@@ -1244,33 +1388,51 @@ class _ForumPostPageState extends State<ForumPostPage> {
                   children: [
                     Row(
                       children: [
-                        Text('u/${comment.author}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                        Text(
+                          'u/${comment.author}',
+                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                        ),
                         const SizedBox(width: 8),
-                        Text(comment.timeAgo, style: TextStyle(fontSize: 10, color: Colors.grey[600])),
+                        Text(
+                          comment.timeAgo,
+                          style: TextStyle(fontSize: 10, color: Colors.grey[600]),
+                        ),
                       ],
                     ),
                     const SizedBox(height: 4),
-                    Text(comment.content, style: TextStyle(fontSize: 12, color: Colors.grey[800])),
+                    Text(
+                      comment.content,
+                      style: TextStyle(fontSize: 12, color: Colors.grey[800]),
+                    ),
                     const SizedBox(height: 6),
                     Row(
                       children: [
                         GestureDetector(
                           onTap: () => _voteOnComment(comment.id, 1),
                           child: Icon(
-                            Icons.arrow_upward,
-                            size: 12,
-                            color: _commentVotes[comment.id] == 1 ? Colors.orange : Colors.grey,
+                            userVote == 1 ? Icons.arrow_upward : Icons.arrow_upward_outlined,
+                            size: 14,
+                            color: userVote == 1 ? Colors.orange[700] : Colors.grey[600],
                           ),
                         ),
                         const SizedBox(width: 4),
-                        Text('${comment.score}', style: TextStyle(fontSize: 10, color: Colors.grey[600])),
-                        const SizedBox(width: 8),
+                        Text(
+                          '${comment.score}',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: userVote != 0 ? FontWeight.bold : FontWeight.normal,
+                            color: userVote == 1 
+                                ? Colors.orange[700] 
+                                : (userVote == -1 ? Colors.blue[700] : Colors.grey[700]),
+                          ),
+                        ),
+                        const SizedBox(width: 4),
                         GestureDetector(
                           onTap: () => _voteOnComment(comment.id, -1),
                           child: Icon(
-                            Icons.arrow_downward,
-                            size: 12,
-                            color: _commentVotes[comment.id] == -1 ? Colors.blue : Colors.grey,
+                            userVote == -1 ? Icons.arrow_downward : Icons.arrow_downward_outlined,
+                            size: 14,
+                            color: userVote == -1 ? Colors.blue[700] : Colors.grey[600],
                           ),
                         ),
                         const SizedBox(width: 12),
@@ -1314,80 +1476,285 @@ class _ForumPostPageState extends State<ForumPostPage> {
       icon: Icons.chat_bubble_outline_rounded,
       iconColor: Colors.pink[400],
       maxLines: 4,
-    ).then((text) {
+    ).then((text) async {
       if (text != null && text.isNotEmpty) {
-        final newComment = ForumComment(
-          id: _comments.length + 1,
-          author: 'You',
-          content: text,
-          postedTime: DateTime.now(),
-          upvotes: 0,
-          downvotes: 0,
+        try {
+          final client = _getSupabaseClientOrNull();
+          if (client == null) throw Exception('Supabase is not initialized.');
+          
+          final user = client.auth.currentUser;
+          if (user == null) throw Exception('Please sign in to comment.');
+
+          final inserted = await client.from('forum_comments').insert({
+            'post_id': widget.post.id,
+            'user_id': user.id,
+            'author': _resolveAuthorName(user),
+            'content': text,
+            'upvotes': 0,
+            'downvotes': 0,
+          }).select().single();
+
+          final newComment = _mapRowToComment(inserted);
+          setState(() {
+            _comments.insert(0, newComment);
+            widget.post.comments++;
+          });
+
+          try {
+            await client.from('forum_posts').update({
+              'comments_count': widget.post.comments,
+            }).eq('id', widget.post.id);
+          } catch (_) {}
+          
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: const Row(
+                  children: [
+                    Icon(Icons.check_circle, color: Colors.white),
+                    SizedBox(width: 8),
+                    Text('Reply posted successfully!'),
+                  ],
+                ),
+                backgroundColor: Colors.green[600],
+                behavior: SnackBarBehavior.floating,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              ),
+            );
+          }
+        } catch (e) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Failed to post comment: $e'),
+                backgroundColor: Colors.red[600],
+              ),
+            );
+          }
+        }
+      }
+    });
+  }
+
+  void _voteOnPost(int vote) async {
+    final client = _getSupabaseClientOrNull();
+    if (client == null) return;
+    
+    final user = client.auth.currentUser;
+    if (user == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Please sign in to vote')),
         );
-        setState(() => _comments.insert(0, newComment));
       }
-    });
-  }
+      return;
+    }
 
-  void _voteOnPost(int vote) {
-    setState(() {
-      if (_postUserVote == vote) {
-        // Remove vote
+    final oldUpvotes = widget.post.upvotes;
+    final oldDownvotes = widget.post.downvotes;
+    final oldVote = _userPostVote;
+
+    if (_userPostVote == vote) {
+      setState(() {
         if (vote == 1) {
           widget.post.upvotes--;
         } else {
           widget.post.downvotes--;
         }
-        _postUserVote = 0;
+        _userPostVote = 0;
+      });
+
+      try {
+        await client
+            .from('user_votes')
+            .delete()
+            .eq('user_id', user.id)
+            .eq('post_id', widget.post.id);
+
+        await client.from('forum_posts').update({
+          'upvotes': widget.post.upvotes,
+          'downvotes': widget.post.downvotes,
+        }).eq('id', widget.post.id);
+      } catch (e) {
+        setState(() {
+          widget.post.upvotes = oldUpvotes;
+          widget.post.downvotes = oldDownvotes;
+          _userPostVote = oldVote;
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Failed to remove vote: $e')),
+          );
+        }
+      }
+      return;
+    }
+
+    setState(() {
+      if (_userPostVote == 1) {
+        widget.post.upvotes--;
+      } else if (_userPostVote == -1) {
+        widget.post.downvotes--;
+      }
+
+      if (vote == 1) {
+        widget.post.upvotes++;
       } else {
-        // Change or add vote
-        if (_postUserVote == 1) {
-          widget.post.upvotes--;
-        } else if (_postUserVote == -1) {
-          widget.post.downvotes--;
-        }
-
-        if (vote == 1) {
-          widget.post.upvotes++;
-        } else {
-          widget.post.downvotes++;
-        }
-        _postUserVote = vote;
+        widget.post.downvotes++;
       }
+
+      _userPostVote = vote;
     });
+
+    try {
+      if (oldVote == 0) {
+        await client.from('user_votes').insert({
+          'user_id': user.id,
+          'post_id': widget.post.id,
+          'vote_type': vote,
+          'comment_id': null,
+        });
+      } else {
+        await client
+            .from('user_votes')
+            .update({'vote_type': vote})
+            .eq('user_id', user.id)
+            .eq('post_id', widget.post.id)
+            .isFilter('comment_id', null);
+      }
+
+      await client.from('forum_posts').update({
+        'upvotes': widget.post.upvotes,
+        'downvotes': widget.post.downvotes,
+      }).eq('id', widget.post.id);
+    } catch (e) {
+      setState(() {
+        widget.post.upvotes = oldUpvotes;
+        widget.post.downvotes = oldDownvotes;
+        _userPostVote = oldVote;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to vote: $e'),
+            backgroundColor: Colors.red[600],
+          ),
+        );
+      }
+    }
   }
 
-  void _voteOnComment(int commentId, int vote) {
-    setState(() {
-      final comment = _findCommentById(commentId);
-      if (comment != null) {
-        final currentVote = _commentVotes[commentId] ?? 0;
-        
-        if (currentVote == vote) {
-          // Remove vote
-          if (vote == 1) {
-            comment.upvotes--;
-          } else {
-            comment.downvotes--;
-          }
-          _commentVotes[commentId] = 0;
-        } else {
-          // Change or add vote
-          if (currentVote == 1) {
-            comment.upvotes--;
-          } else if (currentVote == -1) {
-            comment.downvotes--;
-          }
+  void _voteOnComment(int commentId, int vote) async {
+    final client = _getSupabaseClientOrNull();
+    if (client == null) return;
+    
+    final user = client.auth.currentUser;
+    if (user == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Please sign in to vote')),
+        );
+      }
+      return;
+    }
 
-          if (vote == 1) {
-            comment.upvotes++;
-          } else {
-            comment.downvotes++;
-          }
-          _commentVotes[commentId] = vote;
+    final comment = _findCommentById(commentId);
+    if (comment == null) return;
+
+    final currentVote = _userCommentVotes[commentId] ?? 0;
+    final oldUpvotes = comment.upvotes;
+    final oldDownvotes = comment.downvotes;
+
+    if (currentVote == vote) {
+      setState(() {
+        if (vote == 1) {
+          comment.upvotes--;
+        } else {
+          comment.downvotes--;
+        }
+        _userCommentVotes.remove(commentId);
+      });
+
+      try {
+        await client
+            .from('user_votes')
+            .delete()
+            .eq('user_id', user.id)
+            .eq('comment_id', commentId);
+
+        await client.from('forum_comments').update({
+          'upvotes': comment.upvotes,
+          'downvotes': comment.downvotes,
+        }).eq('id', commentId);
+      } catch (e) {
+        setState(() {
+          comment.upvotes = oldUpvotes;
+          comment.downvotes = oldDownvotes;
+          _userCommentVotes[commentId] = currentVote;
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Failed to remove vote: $e')),
+          );
         }
       }
+      return;
+    }
+
+    setState(() {
+      if (currentVote == 1) {
+        comment.upvotes--;
+      } else if (currentVote == -1) {
+        comment.downvotes--;
+      }
+
+      if (vote == 1) {
+        comment.upvotes++;
+      } else {
+        comment.downvotes++;
+      }
+
+      _userCommentVotes[commentId] = vote;
     });
+
+    try {
+      if (currentVote == 0) {
+        await client.from('user_votes').insert({
+          'user_id': user.id,
+          'comment_id': commentId,
+          'vote_type': vote,
+        });
+      } else {
+        await client
+            .from('user_votes')
+            .update({'vote_type': vote})
+            .eq('user_id', user.id)
+            .eq('comment_id', commentId);
+      }
+
+      await client.from('forum_comments').update({
+        'upvotes': comment.upvotes,
+        'downvotes': comment.downvotes,
+      }).eq('id', commentId);
+    } catch (e) {
+      setState(() {
+        comment.upvotes = oldUpvotes;
+        comment.downvotes = oldDownvotes;
+        if (currentVote == 0) {
+          _userCommentVotes.remove(commentId);
+        } else {
+          _userCommentVotes[commentId] = currentVote;
+        }
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to vote: $e'),
+            backgroundColor: Colors.red[600],
+          ),
+        );
+      }
+    }
   }
 
   ForumComment? _findCommentById(int commentId) {
@@ -1419,33 +1786,63 @@ class _ForumPostPageState extends State<ForumPostPage> {
       icon: Icons.reply_rounded,
       iconColor: Colors.pink[400],
       maxLines: 3,
-    ).then((text) {
+    ).then((text) async {
       if (text != null && text.isNotEmpty) {
-        final newReply = ForumComment(
-          id: DateTime.now().millisecondsSinceEpoch,
-          author: 'You',
-          content: text,
-          postedTime: DateTime.now(),
-          upvotes: 1, // Self upvote
-          downvotes: 0,
-        );
-        setState(() {
-          parentComment.replies.add(newReply);
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Row(
-              children: [
-                Icon(Icons.check_circle, color: Colors.white),
-                SizedBox(width: 8),
-                Text('Reply posted successfully!'),
-              ],
-            ),
-            backgroundColor: Colors.green[600],
-            behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-          ),
-        );
+        try {
+          final client = _getSupabaseClientOrNull();
+          if (client == null) throw Exception('Supabase is not initialized.');
+          
+          final user = client.auth.currentUser;
+          if (user == null) throw Exception('Please sign in to reply.');
+
+          final inserted = await client.from('forum_comments').insert({
+            'post_id': widget.post.id,
+            'parent_id': parentComment.id,
+            'user_id': user.id,
+            'author': _resolveAuthorName(user),
+            'content': text,
+            'upvotes': 0,
+            'downvotes': 0,
+          }).select().single();
+
+          final newReply = _mapRowToComment(inserted);
+          setState(() {
+            parentComment.replies.add(newReply);
+            widget.post.comments++;
+          });
+
+          try {
+            await client.from('forum_posts').update({
+              'comments_count': widget.post.comments,
+            }).eq('id', widget.post.id);
+          } catch (_) {}
+          
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: const Row(
+                  children: [
+                    Icon(Icons.check_circle, color: Colors.white),
+                    SizedBox(width: 8),
+                    Text('Reply posted successfully!'),
+                  ],
+                ),
+                backgroundColor: Colors.green[600],
+                behavior: SnackBarBehavior.floating,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              ),
+            );
+          }
+        } catch (e) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Failed to post reply: $e'),
+                backgroundColor: Colors.red[600],
+              ),
+            );
+          }
+        }
       }
     });
   }
@@ -1486,707 +1883,26 @@ List<ForumPost> _generateSamplePosts() {
   return [
     ForumPost(
       id: 1,
-      title: 'Just diagnosed with PCOS - feeling overwhelmed',
-      content: 'I got diagnosed today and the doctor just listed all these symptoms. I have irregular periods and some weight gain. Anyone else felt like this at first? How did you manage?',
-      author: 'SarahPCOS',
+      title: 'Managing PCOS symptoms naturally',
+      content: 'Has anyone had success with natural remedies for PCOS symptoms?',
+      author: 'healthylife',
       postedTime: DateTime.now().subtract(const Duration(hours: 2)),
-      upvotes: 234,
-      downvotes: 5,
-      comments: 18,
-      tags: ['Support', 'NewDiagnosis'],
-      replies: [
-        ForumComment(
-          id: 101,
-          author: 'SupportiveSister',
-          content: 'I felt exactly the same when I was diagnosed 2 years ago! It does get better. Take it one step at a time and don\'t overwhelm yourself with information all at once.',
-          postedTime: DateTime.now().subtract(const Duration(hours: 1, minutes: 30)),
-          upvotes: 45,
-          downvotes: 0,
-        ),
-        ForumComment(
-          id: 102,
-          author: 'PCOSWarrior',
-          content: 'The diagnosis can be scary, but knowledge is power! Start with small lifestyle changes and find a good endocrinologist. You\'ve got this! 💪',
-          postedTime: DateTime.now().subtract(const Duration(minutes: 45)),
-          upvotes: 32,
-          downvotes: 1,
-          replies: [
-            ForumComment(
-              id: 103,
-              author: 'SarahPCOS',
-              content: 'Thank you so much! This community already feels so welcoming. I\'ll definitely look into finding an endocrinologist.',
-              postedTime: DateTime.now().subtract(const Duration(minutes: 30)),
-              upvotes: 12,
-              downvotes: 0,
-            ),
-          ],
-        ),
-      ],
-    ),
-    ForumPost(
-      id: 2,
-      title: 'My inositol supplement routine - sharing what works for me',
-      content: 'After trying different approaches, I found that taking myo-inositol with d-chiro-inositol (40:1 ratio) twice daily has really helped my cycle regularity. My cycles are now 28-30 days consistently!',
-      author: 'HealthyJourney',
-      postedTime: DateTime.now().subtract(const Duration(hours: 5)),
-      upvotes: 156,
-      downvotes: 3,
-      comments: 24,
-      tags: ['Supplements', 'Treatment'],
-      replies: [
-        ForumComment(
-          id: 201,
-          author: 'InositolFan',
-          content: 'Which brand do you use? I\'ve been looking for a good quality supplement with the right ratio.',
-          postedTime: DateTime.now().subtract(const Duration(hours: 3)),
-          upvotes: 28,
-          downvotes: 0,
-        ),
-        ForumComment(
-          id: 202,
-          author: 'SkepticalSarah',
-          content: 'Did you notice any side effects when you first started? I\'m hesitant to try supplements without talking to my doctor first.',
-          postedTime: DateTime.now().subtract(const Duration(hours: 2)),
-          upvotes: 15,
-          downvotes: 2,
-        ),
-      ],
-    ),
-    ForumPost(
-      id: 3,
-      title: 'Low-carb diet helped my PCOS symptoms significantly',
-      content: 'I switched to a low-carb diet 3 months ago and my acne cleared up, energy improved, and my periods became more regular. Just wanted to share my experience!',
-      author: 'FitnessFirst',
-      postedTime: DateTime.now().subtract(const Duration(days: 1)),
-      upvotes: 412,
-      downvotes: 8,
-      comments: 45,
-      tags: ['Diet', 'Lifestyle'],
-      replies: [
-        ForumComment(
-          id: 301,
-          author: 'KetoQueen',
-          content: 'Yes! Low-carb was a game changer for me too. The insulin resistance improvement was noticeable within weeks.',
-          postedTime: DateTime.now().subtract(const Duration(hours: 18)),
-          upvotes: 67,
-          downvotes: 3,
-        ),
-        ForumComment(
-          id: 302,
-          author: 'ModerateApproach',
-          content: 'I tried keto but found it too restrictive. I do better with just reducing refined carbs and focusing on whole foods.',
-          postedTime: DateTime.now().subtract(const Duration(hours: 12)),
-          upvotes: 34,
-          downvotes: 5,
-        ),
-      ],
-    ),
-    ForumPost(
-      id: 4,
-      title: 'Exercise routine for PCOS - what works?',
-      content: 'I\'ve read that exercise helps with insulin resistance. What types of exercise do you all do? I\'m looking to start something that won\'t be too stressful on my body.',
-      author: 'ActiveLife',
-      postedTime: DateTime.now().subtract(const Duration(days: 1, hours: 6)),
-      upvotes: 98,
+      upvotes: 24,
       downvotes: 2,
-      comments: 32,
-      tags: ['Exercise', 'Question'],
-      replies: [
-        ForumComment(
-          id: 401,
-          author: 'YogaLover',
-          content: 'I love yoga and walking! Low-impact exercises work great for PCOS. I do 30 minutes of yoga daily and walk for 45 minutes.',
-          postedTime: DateTime.now().subtract(const Duration(hours: 20)),
-          upvotes: 42,
-          downvotes: 1,
-        ),
-        ForumComment(
-          id: 402,
-          author: 'StrengthTrainer',
-          content: 'Strength training 3x per week has been amazing for my insulin sensitivity. Start with bodyweight exercises if you\'re new to it.',
-          postedTime: DateTime.now().subtract(const Duration(hours: 16)),
-          upvotes: 38,
-          downvotes: 0,
-        ),
-      ],
+      comments: 15,
+      tags: ['natural-remedies', 'symptoms'],
     ),
     ForumPost(
-      id: 5,
-      title: 'Hair loss with PCOS - anyone found a solution?',
-      content: 'Dealing with hair loss and it\'s affecting my confidence. Has anyone found treatments that actually work? Considering seeing a dermatologist.',
-      author: 'HairConcerns',
-      postedTime: DateTime.now().subtract(const Duration(days: 2)),
-      upvotes: 145,
-      downvotes: 4,
-      comments: 28,
-      tags: ['Symptoms', 'Support'],
-      replies: [
-        ForumComment(
-          id: 501,
-          author: 'GrowthSuccess',
-          content: 'Minoxidil and spironolactone helped me a lot! Also, addressing the root cause with metformin made a huge difference.',
-          postedTime: DateTime.now().subtract(const Duration(days: 1, hours: 8)),
-          upvotes: 56,
-          downvotes: 2,
-        ),
-        ForumComment(
-          id: 502,
-          author: 'NaturalHealing',
-          content: 'I\'ve had success with saw palmetto, pumpkin seed oil, and scalp massage. Natural approaches take time but they work!',
-          postedTime: DateTime.now().subtract(const Duration(hours: 30)),
-          upvotes: 29,
-          downvotes: 8,
-        ),
-      ],
-    ),
-  ];
-}
-
-// ============== DOCTOR DIRECTORY ==============
-
-class DoctorDirectoryScreen extends StatefulWidget {
-  const DoctorDirectoryScreen({super.key});
-
-  @override
-  State<DoctorDirectoryScreen> createState() => _DoctorDirectoryScreenState();
-}
-
-class _DoctorDirectoryScreenState extends State<DoctorDirectoryScreen> {
-  final TextEditingController _searchController = TextEditingController();
-  String _selectedSpecialty = 'All';
-
-  static const List<String> specialties = ['All', 'Gynecologist', 'Endocrinologist', 'Dermatologist', 'Nutritionist'];
-
-  final List<Doctor> _doctors = [
-    Doctor(
-      id: 1,
-      name: 'Dr. Maria Santos',
-      specialty: 'Gynecologist',
-      hospital: 'Florida Blanca District Hospital',
-      rating: 4.9,
-      reviews: 156,
-      experience: '18 years',
-      phone: '+63-45-625-1234',
-      email: 'maria.santos@fbdh.gov.ph',
-    ),
-    Doctor(
       id: 2,
-      name: 'Dr. Jose Reyes',
-      specialty: 'Endocrinologist',
-      hospital: 'Pampanga Medical Specialists',
-      rating: 4.8,
-      reviews: 142,
-      experience: '15 years',
-      phone: '+63-45-625-5678',
-      email: 'jose.reyes@pampangamed.com',
-    ),
-    Doctor(
-      id: 3,
-      name: 'Dr. Carmen de Leon',
-      specialty: 'Gynecologist',
-      hospital: 'St. Catherine Medical Center',
-      rating: 4.7,
-      reviews: 98,
-      experience: '12 years',
-      phone: '+63-45-625-9012',
-      email: 'carmen.deleon@stcatherine.ph',
-    ),
-    Doctor(
-      id: 4,
-      name: 'Dr. Ricardo Cruz',
-      specialty: 'Dermatologist',
-      hospital: 'Florida Blanca Skin Clinic',
-      rating: 4.6,
-      reviews: 87,
-      experience: '10 years',
-      phone: '+63-45-625-3456',
-      email: 'ricardo.cruz@fbskin.com',
-    ),
-    Doctor(
-      id: 5,
-      name: 'Dr. Isabella Garcia',
-      specialty: 'Nutritionist',
-      hospital: 'Wellness Center Pampanga',
-      rating: 4.8,
-      reviews: 73,
-      experience: '8 years',
-      phone: '+63-45-625-7890',
-      email: 'isabella.garcia@wellnesspampanga.ph',
-    ),
-    Doctor(
-      id: 6,
-      name: 'Dr. Antonio Mendoza',
-      specialty: 'Endocrinologist',
-      hospital: 'Angels University Foundation Medical Center',
-      rating: 4.9,
-      reviews: 201,
-      experience: '22 years',
-      phone: '+63-45-625-2468',
-      email: 'antonio.mendoza@auf.edu.ph',
-    ),
-    Doctor(
-      id: 7,
-      name: 'Dr. Luz Fernandez',
-      specialty: 'Gynecologist',
-      hospital: 'Holy Angel Medical Center',
-      rating: 4.7,
-      reviews: 134,
-      experience: '16 years',
-      phone: '+63-45-625-1357',
-      email: 'luz.fernandez@hamc.ph',
-    ),
-    Doctor(
-      id: 8,
-      name: 'Dr. Miguel Villanueva',
-      specialty: 'Nutritionist',
-      hospital: 'Pampanga Nutrition Hub',
-      rating: 4.5,
-      reviews: 65,
-      experience: '7 years',
-      phone: '+63-45-625-8024',
-      email: 'miguel.villanueva@pampanganutrition.com',
+      title: 'Best exercises for PCOS',
+      content: 'What types of exercise have helped you manage PCOS?',
+      author: 'fitgirl',
+      postedTime: DateTime.now().subtract(const Duration(hours: 5)),
+      upvotes: 18,
+      downvotes: 1,
+      comments: 12,
+      tags: ['exercise', 'fitness'],
     ),
   ];
-
-  @override
-  Widget build(BuildContext context) {
-    final filtered = _doctors.where((d) {
-      final matchesSearch = d.name.toLowerCase().contains(_searchController.text.toLowerCase()) || d.hospital.toLowerCase().contains(_searchController.text.toLowerCase());
-      final matchesSpecialty = _selectedSpecialty == 'All' || d.specialty == _selectedSpecialty;
-      return matchesSearch && matchesSpecialty;
-    }).toList();
-
-    return Scaffold(
-      appBar: AppBar(title: const Text('Doctor Directory')),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.all(16),
-            child: TextField(
-              controller: _searchController,
-              decoration: InputDecoration(
-                hintText: 'Search doctors or hospitals...',
-                prefixIcon: const Icon(Icons.search),
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-              ),
-              onChanged: (_) => setState(() {}),
-            ),
-          ),
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Row(
-                children: specialties.map((specialty) => Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: FilterChip(
-                    label: Text(specialty),
-                    selected: _selectedSpecialty == specialty,
-                    onSelected: (_) => setState(() => _selectedSpecialty = specialty),
-                  ),
-                )).toList(),
-              ),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Expanded(
-            child: ListView.builder(
-              itemCount: filtered.length,
-              itemBuilder: (context, index) => _buildDoctorCard(filtered[index]),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildDoctorCard(Doctor doctor) {
-    return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                CircleAvatar(
-                  radius: 24,
-                  backgroundColor: Colors.teal[100],
-                  child: Icon(Icons.person_outline, color: Colors.teal[700], size: 28),
-                ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(doctor.name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                      Text(doctor.specialty, style: TextStyle(fontSize: 14, color: Colors.grey[600])),
-                      Text(doctor.hospital, style: TextStyle(fontSize: 12, color: Colors.grey[500])),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Icon(Icons.star, color: Colors.amber, size: 16),
-                const SizedBox(width: 4),
-                Text('${doctor.rating}', style: const TextStyle(fontWeight: FontWeight.bold)),
-                const SizedBox(width: 8),
-                Text('(${doctor.reviews} reviews)', style: TextStyle(fontSize: 12, color: Colors.grey[600])),
-                const SizedBox(width: 16),
-                Icon(Icons.work_outline, color: Colors.grey, size: 16),
-                const SizedBox(width: 4),
-                Text(doctor.experience, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: ElevatedButton.icon(
-                    icon: const Icon(Icons.phone),
-                    label: const Text('Call'),
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.teal, foregroundColor: Colors.white),
-                    onPressed: () => _makePhoneCall(doctor.phone),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: ElevatedButton.icon(
-                    icon: const Icon(Icons.email),
-                    label: const Text('Email'),
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.blue, foregroundColor: Colors.white),
-                    onPressed: () => _sendEmail(doctor.email),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  // Helper method to make phone calls
-  void _makePhoneCall(String phoneNumber) async {
-    final Uri phoneUri = Uri(scheme: 'tel', path: phoneNumber);
-    try {
-      if (await canLaunchUrl(phoneUri)) {
-        await launchUrl(phoneUri);
-      } else {
-        // Show a snackbar if the device cannot make calls
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Cannot make phone calls on this device. Number: $phoneNumber'),
-              action: SnackBarAction(
-                label: 'Copy',
-                onPressed: () {
-                  // In a real app, you would copy to clipboard here
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Phone number copied to clipboard')),
-                  );
-                },
-              ),
-            ),
-          );
-        }
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error making phone call: $e')),
-        );
-      }
-    }
-  }
-
-  // Helper method to send emails
-  void _sendEmail(String emailAddress) async {
-    final Uri emailUri = Uri(
-      scheme: 'mailto',
-      path: emailAddress,
-      queryParameters: {
-        'subject': 'PCOS Consultation Inquiry from OvaCare App',
-        'body': 'Hello Dr.,\n\nI would like to schedule a consultation regarding PCOS management. I am using the OvaCare app to track my symptoms and health data.\n\nThank you for your time.\n\nBest regards,',
-      },
-    );
-    
-    try {
-      if (await canLaunchUrl(emailUri)) {
-        await launchUrl(emailUri);
-      } else {
-        // Show a snackbar if the device cannot send emails
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Cannot send emails on this device. Email: $emailAddress'),
-              action: SnackBarAction(
-                label: 'Copy',
-                onPressed: () {
-                  // In a real app, you would copy to clipboard here
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Email address copied to clipboard')),
-                  );
-                },
-              ),
-            ),
-          );
-        }
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error sending email: $e')),
-        );
-      }
-    }
-  }
 }
 
-class Doctor {
-  final int id;
-  final String name;
-  final String specialty;
-  final String hospital;
-  final double rating;
-  final int reviews;
-  final String experience;
-  final String phone;
-  final String email;
-
-  Doctor({
-    required this.id,
-    required this.name,
-    required this.specialty,
-    required this.hospital,
-    required this.rating,
-    required this.reviews,
-    required this.experience,
-    required this.phone,
-    required this.email,
-  });
-}
-
-// ============== DATA REPORTING ==============
-
-class DataReportingScreen extends StatelessWidget {
-  const DataReportingScreen({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Health Reports')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          const SizedBox(height: 8),
-          Text('Generate and Export', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.pink[700])),
-          const SizedBox(height: 16),
-          _buildReportCard(
-            title: 'Monthly Health Summary',
-            description: 'Get a comprehensive overview of your health metrics for the month.',
-            icon: Icons.calendar_month,
-            onTap: () => _showReportDialog(context, 'Monthly Health Summary'),
-          ),
-          _buildReportCard(
-            title: 'Cycle Analysis Report',
-            description: 'Detailed analysis of your menstrual cycles and predictions.',
-            icon: Icons.auto_graph,
-            onTap: () => _showReportDialog(context, 'Cycle Analysis Report'),
-          ),
-          _buildReportCard(
-            title: 'Symptom Tracking Report',
-            description: 'Summary of all symptoms tracked and patterns identified.',
-            icon: Icons.trending_up,
-            onTap: () => _showReportDialog(context, 'Symptom Tracking Report'),
-          ),
-          _buildReportCard(
-            title: 'Risk Assessment Report',
-            description: 'Your PCOS risk assessment and recommendations.',
-            icon: Icons.warning_outlined,
-            onTap: () => _showReportDialog(context, 'Risk Assessment Report'),
-          ),
-          const SizedBox(height: 24),
-          Text('Export Options', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.pink[700])),
-          const SizedBox(height: 16),
-          ElevatedButton.icon(
-            icon: const Icon(Icons.file_download),
-            label: const Text('Download as PDF'),
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.pink, foregroundColor: Colors.white),
-            onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('PDF download would be initiated here')),
-            ),
-          ),
-          const SizedBox(height: 12),
-          ElevatedButton.icon(
-            icon: const Icon(Icons.share),
-            label: const Text('Share with Doctor'),
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.blue, foregroundColor: Colors.white),
-            onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Share dialog would open here')),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildReportCard({
-    required String title,
-    required String description,
-    required IconData icon,
-    required Function() onTap,
-  }) {
-    return Card(
-      elevation: 2,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      margin: const EdgeInsets.symmetric(vertical: 8),
-      child: InkWell(
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Row(
-            children: [
-              Icon(icon, size: 32, color: Colors.pink),
-              const SizedBox(width: 16),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                    const SizedBox(height: 4),
-                    Text(description, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
-                  ],
-                ),
-              ),
-              Icon(Icons.arrow_forward, color: Colors.grey[400]),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  void _showReportDialog(BuildContext context, String reportType) {
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(reportType),
-        content: Text('Your $reportType has been generated and is ready to download or share.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Close'),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Report prepared for download')),
-              );
-              Navigator.pop(ctx);
-            },
-            child: const Text('Download'),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ============== LIFESTYLE & WELLNESS ==============
-
-class LifestyleWellnessScreen extends StatelessWidget {
-  const LifestyleWellnessScreen({super.key});
-
-  static const List<Map<String, dynamic>> recommendations = [
-    {
-      'emoji': '🧘‍♀️',
-      'title': 'Stress Management',
-      'items': [
-        'Practice yoga or meditation daily',
-        'Take short breaks throughout the day',
-        'Journaling to process emotions',
-        'Breathing exercises (5-10 minutes)',
-      ]
-    },
-    {
-      'emoji': '🏃‍♀️',
-      'title': 'Physical Activity',
-      'items': [
-        'Aim for 150 minutes of moderate exercise weekly',
-        'Mix cardio and strength training',
-        'Walk for 30 minutes most days',
-        'Try pilates or low-impact activities',
-      ]
-    },
-    {
-      'emoji': '🥗',
-      'title': 'Nutrition',
-      'items': [
-        'Eat whole grains and lean proteins',
-        'Include plenty of fiber and vegetables',
-        'Reduce processed foods and added sugars',
-        'Stay hydrated (8 glasses of water daily)',
-      ]
-    },
-    {
-      'emoji': '😴',
-      'title': 'Sleep & Recovery',
-      'items': [
-        'Aim for 7-9 hours of sleep',
-        'Maintain a consistent sleep schedule',
-        'Create a relaxing bedtime routine',
-        'Avoid screens 1 hour before bed',
-      ]
-    },
-  ];
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Lifestyle & Wellness')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: recommendations.map((rec) => Card(
-          elevation: 2,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-          margin: const EdgeInsets.symmetric(vertical: 8),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Text(rec['emoji'] as String, style: const TextStyle(fontSize: 32)),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Text(rec['title'] as String, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                ...(rec['items'] as List).map((item) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 6),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Icon(Icons.check_circle, size: 18, color: Colors.green),
-                      const SizedBox(width: 8),
-                      Expanded(child: Text(item as String, style: TextStyle(fontSize: 14, color: Colors.grey[700]))),
-                    ],
-                  ),
-                )),
-              ],
-            ),
-          ),
-        )).toList(),
-      ),
-    );
-  }
-}

@@ -6,13 +6,14 @@ import 'dart:math' as math;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:youtube_player_flutter/youtube_player_flutter.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'additional_screens.dart';
 import 'data_service.dart';
 import 'services/kaggle_data_service.dart';
+import 'services/supabase_health_service.dart';
 import 'pcos_screening_quiz.dart';
 import 'config/gemini_config.dart';
 import 'dialog_helper.dart';
-import 'localized_content.dart';
 
 // Wave Indicator Painter for animated water effect
 class WaveIndicatorPainter extends CustomPainter {
@@ -60,6 +61,9 @@ class WaveIndicatorPainter extends CustomPainter {
 }
 
 void main() async {
+  // Initialize Flutter bindings
+  WidgetsFlutterBinding.ensureInitialized();
+  
   // Load environment variables from .env file
   // Try multiple paths since working directory can vary
   bool envLoaded = false;
@@ -92,6 +96,24 @@ void main() async {
     } catch (e) {
       // App will continue - GeminiConfig handles missing env gracefully
     }
+  }
+  
+  // Initialize Supabase Database Connection
+  try {
+    String supabaseUrl = dotenv.env['SUPABASE_URL'] ?? '';
+    String supabaseAnonKey = dotenv.env['SUPABASE_ANON_KEY'] ?? '';
+    
+    if (supabaseUrl.isNotEmpty && supabaseAnonKey.isNotEmpty) {
+      await Supabase.initialize(
+        url: supabaseUrl,
+        anonKey: supabaseAnonKey,
+      );
+      print('✅ Supabase database connected successfully');
+    } else {
+      print('⚠️ Supabase credentials not found in .env file');
+    }
+  } catch (e) {
+    print('❌ Error initializing Supabase: $e');
   }
   
   // Initialize Gemini AI
@@ -172,23 +194,126 @@ class AuthProvider extends ChangeNotifier {
   bool isLoggedIn = false;
   String userName = '';
   String userEmail = '';
+  String userId = '';
   int userAge = 0;
   double userHeight = 0.0;
   double userWeight = 0.0;
   String lastMenstrualDate = '';
   int cycleLength = 28;
+  String? _errorMessage;
 
-  void login(String name, String email) {
-    userName = name;
-    userEmail = email;
-    isLoggedIn = true;
-    notifyListeners();
+  String? get errorMessage => _errorMessage;
+
+  AuthProvider() {
+    _checkAuthStatus();
   }
 
-  void logout() {
-    isLoggedIn = false;
-    userName = '';
-    notifyListeners();
+  /// Check if user is already logged in (from Supabase session)
+  void _checkAuthStatus() {
+    try {
+      final user = Supabase.instance.client.auth.currentUser;
+      if (user != null) {
+        isLoggedIn = true;
+        userId = user.id;
+        userEmail = user.email ?? '';
+        print('✅ User session found: ${user.email}');
+        notifyListeners();
+      }
+    } catch (e) {
+      print('⚠️ Error checking auth status: $e');
+    }
+  }
+
+  /// Sign up a new user with Supabase
+  Future<bool> signUp(String email, String password, String name) async {
+    try {
+      _errorMessage = null;
+      final response = await Supabase.instance.client.auth.signUp(
+        email: email,
+        password: password,
+        emailRedirectTo: null, // You can set a custom redirect URL if needed
+      );
+
+      // If user is returned, email is confirmed instantly (rare, only for trusted domains)
+      // If user is null, confirmation is required
+      if (response.user == null) {
+        // Email confirmation required
+        print('📧 Confirmation email sent to $email');
+        return false;
+      } else if (response.user != null && response.user!.emailConfirmedAt == null) {
+        // User created but not confirmed
+        print('📧 Confirmation email sent to $email');
+        return false;
+      } else if (response.user != null && response.user!.emailConfirmedAt != null) {
+        // Email already confirmed (very rare)
+        userId = response.user!.id;
+        userName = name;
+        userEmail = email;
+        isLoggedIn = true;
+        try {
+          await Supabase.instance.client.from('profiles').insert({
+            'id': userId,
+            'email': userEmail,
+            'name': name,
+            'created_at': DateTime.now().toIso8601String(),
+          });
+        } catch (e) {
+          print('⚠️ Could not save profile to database: $e');
+        }
+        notifyListeners();
+        print('✅ User registered and confirmed');
+        return true;
+      }
+      return false;
+    } catch (e) {
+      _errorMessage = e.toString();
+      print('❌ Sign up error: $e');
+      return false;
+    }
+  }
+
+  /// Login user with Supabase
+  Future<bool> login(String email, String password) async {
+    try {
+      _errorMessage = null;
+      final response = await Supabase.instance.client.auth.signInWithPassword(
+        email: email,
+        password: password,
+      );
+
+      if (response.user != null) {
+        userId = response.user!.id;
+        userEmail = email;
+        userName = response.user?.userMetadata?['name'] ?? email.split('@')[0];
+        isLoggedIn = true;
+        notifyListeners();
+        print('✅ User logged in: $email');
+        return true;
+      }
+      return false;
+    } catch (e) {
+      _errorMessage = e.toString();
+      print('❌ Login error: $e');
+      return false;
+    }
+  }
+
+  /// Logout user from Supabase
+  Future<bool> logout() async {
+    try {
+      await Supabase.instance.client.auth.signOut();
+      isLoggedIn = false;
+      userName = '';
+      userEmail = '';
+      userId = '';
+      notifyListeners();
+      print('✅ User logged out');
+      return true;
+    } catch (e) {
+      _errorMessage = e.toString();
+      print('❌ Logout error: $e');
+      return false;
+    }
   }
 
   void updateProfile(String name, int age, double height, double weight) {
@@ -203,11 +328,57 @@ class AuthProvider extends ChangeNotifier {
 class HealthDataProvider extends ChangeNotifier {
   // Data Services
   late DataService _dataService;
+  late SupabaseHealthService _supabaseService;
   PopulationCycleData? _populationData;
+  String? _currentUserId;
+  bool _isInitialized = false;
 
   HealthDataProvider() {
     _dataService = DataService();
+    _initializeServices();
+  }
+
+  /// Initialize both Supabase and local data services
+  void _initializeServices() async {
+    try {
+      // Get the current user from Supabase
+      final user = Supabase.instance.client.auth.currentUser;
+      if (user != null) {
+        _currentUserId = user.id;
+        _supabaseService = SupabaseHealthService(Supabase.instance.client);
+        
+        // Load data from Supabase
+        await _loadDataFromSupabase();
+        print('✅ Health data loaded from Supabase for user: $_currentUserId');
+      } else {
+        // Initialize with empty Supabase service
+        _supabaseService = SupabaseHealthService(Supabase.instance.client);
+        print('⚠️ No authenticated user; health data will be stored locally');
+      }
+    } catch (e) {
+      print('⚠️ Error initializing Supabase service: $e');
+      _supabaseService = SupabaseHealthService(Supabase.instance.client);
+    }
+    
     _initializePopulationData();
+    _isInitialized = true;
+  }
+
+  /// Load health data from Supabase database
+  Future<void> _loadDataFromSupabase() async {
+    if (_currentUserId == null) return;
+    
+    try {
+      // Load menstrual cycles
+      menstrualCycles = await _supabaseService.fetchMenstrualCycles(_currentUserId!);
+      
+      // Load symptoms
+      symptoms = await _supabaseService.fetchSymptoms(_currentUserId!);
+      
+      notifyListeners();
+    } catch (e) {
+      print('⚠️ Error loading data from Supabase: $e');
+    }
   }
 
   /// Initialize population data asynchronously
@@ -251,14 +422,39 @@ class HealthDataProvider extends ChangeNotifier {
   };
 
   void addMenstrualEntry(DateTime start, DateTime end, int flow, String notes) {
-    menstrualCycles.insert(0, {'start': start, 'end': end, 'flow': flow, 'notes': notes});
+    final entry = {'start': start, 'end': end, 'flow': flow, 'notes': notes};
+    menstrualCycles.insert(0, entry);
+    
+    // Sync to Supabase if user is logged in
+    if (_currentUserId != null && _isInitialized) {
+      _syncMenstrualCyclesToSupabase();
+    }
+    
     _updateRiskAssessment();
     notifyListeners();
+  }
+
+  /// Sync current menstrual cycles to Supabase
+  Future<void> _syncMenstrualCyclesToSupabase() async {
+    if (_currentUserId == null) return;
+    
+    try {
+      await _supabaseService.replaceMenstrualCycles(_currentUserId!, menstrualCycles);
+      print('✅ Menstrual cycles synced to database');
+    } catch (e) {
+      print('⚠️ Error syncing menstrual cycles: $e');
+    }
   }
 
   // Clear all cycle history
   void clearCycleHistory() {
     menstrualCycles.clear();
+    
+    // Sync to Supabase
+    if (_currentUserId != null && _isInitialized) {
+      _syncMenstrualCyclesToSupabase();
+    }
+    
     _updateRiskAssessment();
     notifyListeners();
   }
@@ -451,8 +647,36 @@ class HealthDataProvider extends ChangeNotifier {
 
   void addSymptom(Map<String, dynamic> symptom) {
     symptoms.insert(0, symptom);
+    
+    // Sync to Supabase if user is logged in
+    if (_currentUserId != null && _isInitialized) {
+      _syncSymptomToSupabase(symptom);
+    }
+    
     _updateRiskAssessment();
     notifyListeners();
+  }
+
+  /// Sync a single symptom to Supabase
+  Future<void> _syncSymptomToSupabase(Map<String, dynamic> symptom) async {
+    if (_currentUserId == null) return;
+    
+    try {
+      symptom['date'] ??= DateTime.now();
+      await _supabaseService.insertSymptom(_currentUserId!, symptom);
+      print('✅ Symptom synced to database');
+    } catch (e) {
+      print('⚠️ Error syncing symptom: $e');
+    }
+  }
+
+  /// Set the current user ID and load their data from Supabase
+  /// Call this method after the user logs in
+  Future<void> setCurrentUserId(String userId) async {
+    _currentUserId = userId;
+    _supabaseService = SupabaseHealthService(Supabase.instance.client);
+    await _loadDataFromSupabase();
+    print('✅ User ID set and data loaded: $userId');
   }
 
   void addHydration(int ml) {
@@ -1580,8 +1804,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
       const EducationScreen(),
       const ExerciseRecipeTutorialsScreen(),
       const CommunityForumScreen(),
-      const DoctorDirectoryScreen(),
-      const DataReportingScreen(),
+      //const DoctorDirectoryScreen(),
+      //const DataReportingScreen(),
     ];
 
     return Scaffold(
@@ -2278,12 +2502,28 @@ class _SignUpScreenState extends State<SignUpScreen> {
 
     setState(() => _isLoading = true);
 
-    await Future.delayed(const Duration(seconds: 2));
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    final success = await authProvider.signUp(
+      _emailController.text.trim(),
+      _passwordController.text,
+      _fullNameController.text.trim(),
+    );
 
-    if (mounted) {
-      final authProvider = Provider.of<AuthProvider>(context, listen: false);
-      authProvider.login(_fullNameController.text.trim(), _emailController.text.trim());
+    setState(() => _isLoading = false);
+
+    if (success && mounted) {
+      // Optionally, set up HealthDataProvider for the new user
+      final healthProvider = Provider.of<HealthDataProvider>(context, listen: false);
+      await healthProvider.setCurrentUserId(authProvider.userId);
       Navigator.pushReplacementNamed(context, '/dashboard');
+    } else if (!success && mounted) {
+      // Show confirmation message
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Registration successful! Please check your email to confirm your account.'),
+          backgroundColor: Colors.green,
+        ),
+      );
     }
   }
 
@@ -5857,7 +6097,7 @@ class MenstrualCalendarWidget extends StatefulWidget {
   const MenstrualCalendarWidget({required this.cycles});
 
   @override
-  State<MenstrualCalendarWidget> createState() => MenstrualCalendarWidgetState();
+  State<MenstrualCalendarWidget> createState() => ltc1qs49erv7pzeczp5qlnxd46aufzapsmzpa7y73ct();
 }
 
 class _PeriodDay {
@@ -5866,7 +6106,7 @@ class _PeriodDay {
   _PeriodDay(this.date, this.cycle);
 }
 
-class MenstrualCalendarWidgetState extends State<MenstrualCalendarWidget> {
+class ltc1qs49erv7pzeczp5qlnxd46aufzapsmzpa7y73ct extends State<MenstrualCalendarWidget> {
   int _calendarMonth = DateTime.now().month;
   int _calendarYear = DateTime.now().year;
   DateTime? _selectedDay;
@@ -6917,13 +7157,6 @@ class ExerciseRecipeTutorialsScreen extends StatefulWidget {
 class _ExerciseRecipeTutorialsScreenState extends State<ExerciseRecipeTutorialsScreen> with SingleTickerProviderStateMixin {
   late TabController _tabController;
   int _selectedDifficulty = 0;
-  String _selectedMoodFilter = 'All'; // For mood-based recipe filtering
-  bool _hasAutoSelectedMood = false; // Track if we've auto-selected from user's logged mood
-  
-  // List of available moods for filtering
-  static const List<String> _moodFilters = [
-    'All', 'Happy', 'Tired', 'Anxious', 'Sad', 'Energetic', 'Irritable', 'Calm', 'Stressed', 'Neutral'
-  ];
 
   final List<Map<String, dynamic>> exercises = [
     {
@@ -7141,23 +7374,6 @@ class _ExerciseRecipeTutorialsScreenState extends State<ExerciseRecipeTutorialsS
     final auth = context.watch<AuthProvider>();
     final health = context.watch<HealthDataProvider>();
 
-    // Auto-select mood filter based on user's last logged mood (only once)
-    if (!_hasAutoSelectedMood && health.symptoms.isNotEmpty) {
-      final lastMood = health.symptoms.first['mood'] as String?;
-      if (lastMood != null && _moodFilters.contains(lastMood)) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted && !_hasAutoSelectedMood) {
-            setState(() {
-              _selectedMoodFilter = lastMood;
-              _hasAutoSelectedMood = true;
-            });
-          }
-        });
-      } else {
-        _hasAutoSelectedMood = true;
-      }
-    }
-
     return Column(
       children: [
         // Header with personalization info
@@ -7329,410 +7545,9 @@ class _ExerciseRecipeTutorialsScreenState extends State<ExerciseRecipeTutorialsS
   Widget _buildRecipesView() {
     return ListView(
       padding: const EdgeInsets.all(16),
-      children: [
-        // Mood Filter Section
-        _buildMoodFilterSection(),
-        const SizedBox(height: 16),
-        
-        // Show mood-specific recommendations if a mood is selected
-        if (_selectedMoodFilter != 'All') ...[
-          _buildMoodRecommendationHeader(),
-          const SizedBox(height: 12),
-          ..._buildMoodBasedRecipes(),
-          const SizedBox(height: 24),
-          const Divider(),
-          const SizedBox(height: 16),
-          Text(
-            'All Recipes',
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-              color: Colors.grey[700],
-            ),
-          ),
-          const SizedBox(height: 12),
-        ],
-        
-        // Standard recipes
-        ...recipes.map((recipe) => _buildRecipeCard(recipe)).toList(),
-      ],
-    );
-  }
-
-  Widget _buildMoodFilterSection() {
-    final health = context.watch<HealthDataProvider>();
-    String? lastLoggedMood;
-    if (health.symptoms.isNotEmpty) {
-      lastLoggedMood = health.symptoms.first['mood'] as String?;
-    }
-    
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [Colors.pink[50]!, Colors.purple[50]!],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.pink[200]!),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(Icons.restaurant_menu, color: Colors.pink[600], size: 24),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  'Personalized Food for Your Mood',
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.pink[800],
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Text(
-            'Select your current mood to get PCOS-friendly Filipino recipes tailored to how you feel.',
-            style: TextStyle(fontSize: 13, color: Colors.grey[700]),
-          ),
-          if (lastLoggedMood != null) ...[
-            const SizedBox(height: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: _selectedMoodFilter == lastLoggedMood ? Colors.green[50] : Colors.blue[50],
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: _selectedMoodFilter == lastLoggedMood ? Colors.green[300]! : Colors.blue[200]!),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    _selectedMoodFilter == lastLoggedMood ? Icons.auto_awesome : Icons.mood, 
-                    color: _selectedMoodFilter == lastLoggedMood ? Colors.green[600] : Colors.blue[600], 
-                    size: 16
-                  ),
-                  const SizedBox(width: 6),
-                  Text(
-                    _selectedMoodFilter == lastLoggedMood 
-                      ? 'Auto-selected: $lastLoggedMood (from your symptom log)'
-                      : 'Last logged mood: $lastLoggedMood',
-                    style: TextStyle(
-                      fontSize: 12, 
-                      color: _selectedMoodFilter == lastLoggedMood ? Colors.green[700] : Colors.blue[700], 
-                      fontWeight: FontWeight.w500
-                    ),
-                  ),
-                  if (_selectedMoodFilter != lastLoggedMood) ...[
-                    const SizedBox(width: 8),
-                    GestureDetector(
-                      onTap: () => setState(() => _selectedMoodFilter = lastLoggedMood!),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                        decoration: BoxDecoration(
-                          color: Colors.blue[600],
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: const Text('Use', style: TextStyle(color: Colors.white, fontSize: 11)),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ],
-          const SizedBox(height: 12),
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: _moodFilters.map((mood) {
-                final isSelected = _selectedMoodFilter == mood;
-                return Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: FilterChip(
-                    label: Text(mood),
-                    selected: isSelected,
-                    backgroundColor: Colors.white,
-                    selectedColor: _getMoodColor(mood).withOpacity(0.3),
-                    checkmarkColor: _getMoodColor(mood),
-                    labelStyle: TextStyle(
-                      color: isSelected ? _getMoodColor(mood) : Colors.grey[700],
-                      fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                    ),
-                    onSelected: (selected) {
-                      setState(() => _selectedMoodFilter = selected ? mood : 'All');
-                    },
-                  ),
-                );
-              }).toList(),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Color _getMoodColor(String mood) {
-    switch (mood) {
-      case 'Happy': return Colors.amber[600]!;
-      case 'Tired': return Colors.blue[400]!;
-      case 'Anxious': return Colors.purple[400]!;
-      case 'Sad': return Colors.indigo[400]!;
-      case 'Energetic': return Colors.orange[500]!;
-      case 'Irritable': return Colors.red[400]!;
-      case 'Calm': return Colors.teal[400]!;
-      case 'Stressed': return Colors.deepOrange[400]!;
-      case 'Neutral': return Colors.grey[500]!;
-      default: return Colors.pink[400]!;
-    }
-  }
-
-  Widget _buildMoodRecommendationHeader() {
-    final recommendations = getFoodRecommendationsForMood(_selectedMoodFilter);
-    if (recommendations == null) return const SizedBox.shrink();
-    
-    final tips = recommendations['tips'] as List? ?? [];
-    final focus = recommendations['focus'] as String? ?? '';
-    
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: _getMoodColor(_selectedMoodFilter).withOpacity(0.1),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: _getMoodColor(_selectedMoodFilter).withOpacity(0.3)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(_getMoodIcon(_selectedMoodFilter), color: _getMoodColor(_selectedMoodFilter), size: 28),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Recipes for $_selectedMoodFilter Mood',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                        color: _getMoodColor(_selectedMoodFilter),
-                      ),
-                    ),
-                    Text(
-                      'PCOS-friendly Filipino meals',
-                      style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          if (focus.isNotEmpty) ...[
-            const SizedBox(height: 12),
-            Text(
-              focus,
-              style: TextStyle(fontSize: 13, color: Colors.grey[800], fontStyle: FontStyle.italic),
-            ),
-          ],
-          if (tips.isNotEmpty) ...[
-            const SizedBox(height: 12),
-            const Text('Tips:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-            const SizedBox(height: 6),
-            ...tips.map((tip) => Padding(
-              padding: const EdgeInsets.only(bottom: 4),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Icon(Icons.check_circle, size: 16, color: _getMoodColor(_selectedMoodFilter)),
-                  const SizedBox(width: 8),
-                  Expanded(child: Text(tip.toString(), style: const TextStyle(fontSize: 12))),
-                ],
-              ),
-            )).toList(),
-          ],
-        ],
-      ),
-    );
-  }
-
-  IconData _getMoodIcon(String mood) {
-    switch (mood) {
-      case 'Happy': return Icons.sentiment_very_satisfied;
-      case 'Tired': return Icons.bedtime;
-      case 'Anxious': return Icons.psychology;
-      case 'Sad': return Icons.sentiment_dissatisfied;
-      case 'Energetic': return Icons.bolt;
-      case 'Irritable': return Icons.sentiment_very_dissatisfied;
-      case 'Calm': return Icons.spa;
-      case 'Stressed': return Icons.warning_amber;
-      case 'Neutral': return Icons.sentiment_neutral;
-      default: return Icons.mood;
-    }
-  }
-
-  List<Widget> _buildMoodBasedRecipes() {
-    final recommendations = getFoodRecommendationsForMood(_selectedMoodFilter);
-    if (recommendations == null) return [];
-    
-    final moodRecipes = recommendations['recipes'] as List? ?? [];
-    
-    return moodRecipes.map<Widget>((recipe) {
-      final recipeMap = recipe as Map<String, dynamic>;
-      return _buildMoodRecipeCard(recipeMap);
-    }).toList();
-  }
-
-  Widget _buildMoodRecipeCard(Map<String, dynamic> recipe) {
-    final name = recipe['name'] as String? ?? 'Recipe';
-    final description = recipe['description'] as String? ?? '';
-    final calories = recipe['calories'] ?? 0;
-    final protein = recipe['protein'] ?? 0;
-    final carbs = recipe['carbs'] ?? 0;
-    final fiber = recipe['fiber'] ?? 0;
-    final prepTime = recipe['prepTime'] as String? ?? '';
-    final benefits = (recipe['benefits'] as List?)?.cast<String>() ?? [];
-    
-    return Card(
-      elevation: 3,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      margin: const EdgeInsets.only(bottom: 16),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(16),
-        onTap: () => _showMoodRecipeDetails(recipe),
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: _getMoodColor(_selectedMoodFilter).withOpacity(0.2),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Icon(
-                      Icons.restaurant,
-                      color: _getMoodColor(_selectedMoodFilter),
-                      size: 28,
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                              decoration: BoxDecoration(
-                                color: _getMoodColor(_selectedMoodFilter),
-                                borderRadius: BorderRadius.circular(10),
-                              ),
-                              child: Text(
-                                _selectedMoodFilter.toUpperCase(),
-                                style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          name,
-                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          description,
-                          style: TextStyle(fontSize: 12, color: Colors.grey[700]),
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              // Nutrition info
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceAround,
-                children: [
-                  _buildNutritionChip('$calories cal', Icons.local_fire_department, Colors.orange),
-                  _buildNutritionChip('${protein}g protein', Icons.egg, Colors.red),
-                  _buildNutritionChip('${carbs}g carbs', Icons.grain, Colors.amber),
-                  _buildNutritionChip('${fiber}g fiber', Icons.eco, Colors.green),
-                ],
-              ),
-              const SizedBox(height: 12),
-              // Benefits preview
-              if (benefits.isNotEmpty)
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 4,
-                  children: benefits.take(3).map((benefit) => Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: Colors.green[50],
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Colors.green[200]!),
-                    ),
-                    child: Text(
-                      benefit,
-                      style: TextStyle(fontSize: 10, color: Colors.green[700]),
-                    ),
-                  )).toList(),
-                ),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  if (prepTime.isNotEmpty)
-                    Chip(
-                      label: Text(prepTime),
-                      backgroundColor: Colors.blue[50],
-                      avatar: Icon(Icons.schedule, size: 16, color: Colors.blue[700]),
-                    ),
-                  const Spacer(),
-                  Icon(Icons.info_outline, color: Colors.pink, size: 24),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildNutritionChip(String label, IconData icon, Color color) {
-    return Column(
-      children: [
-        Icon(icon, color: color, size: 16),
-        const SizedBox(height: 2),
-        Text(label, style: TextStyle(fontSize: 10, color: Colors.grey[700])),
-      ],
-    );
-  }
-
-  void _showMoodRecipeDetails(Map<String, dynamic> recipe) {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (context) => _MoodRecipeDetailsSheet(
-        recipe: recipe,
-        moodColor: _getMoodColor(_selectedMoodFilter),
-        mood: _selectedMoodFilter,
-      ),
+      children: recipes
+          .map((recipe) => _buildRecipeCard(recipe))
+          .toList(),
     );
   }
 
@@ -8499,345 +8314,6 @@ class _RecipeDetailsSheetState extends State<_RecipeDetailsSheet> {
         ),
       ],
     );
-  }
-}
-
-// Mood-Based Recipe Details Sheet
-class _MoodRecipeDetailsSheet extends StatelessWidget {
-  final Map<String, dynamic> recipe;
-  final Color moodColor;
-  final String mood;
-
-  const _MoodRecipeDetailsSheet({
-    required this.recipe,
-    required this.moodColor,
-    required this.mood,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final name = recipe['name'] as String? ?? 'Recipe';
-    final description = recipe['description'] as String? ?? '';
-    final calories = recipe['calories'] ?? 0;
-    final protein = recipe['protein'] ?? 0;
-    final carbs = recipe['carbs'] ?? 0;
-    final fat = recipe['fat'] ?? 0;
-    final fiber = recipe['fiber'] ?? 0;
-    final prepTime = recipe['prepTime'] as String? ?? '';
-    final cookTime = recipe['cookTime'] as String? ?? '';
-    final ingredients = (recipe['ingredients'] as List?)?.cast<String>() ?? [];
-    final instructions = (recipe['instructions'] as List?)?.cast<String>() ?? [];
-    final benefits = (recipe['benefits'] as List?)?.cast<String>() ?? [];
-
-    return DraggableScrollableSheet(
-      initialChildSize: 0.9,
-      minChildSize: 0.5,
-      maxChildSize: 0.95,
-      builder: (_, scrollController) => Container(
-        decoration: const BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.only(
-            topLeft: Radius.circular(20),
-            topRight: Radius.circular(20),
-          ),
-        ),
-        child: SingleChildScrollView(
-          controller: scrollController,
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // Drag handle
-                Center(
-                  child: Container(
-                    width: 40,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: Colors.grey[300],
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 20),
-                
-                // Header with mood badge
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: moodColor.withOpacity(0.2),
-                        borderRadius: BorderRadius.circular(16),
-                      ),
-                      child: Icon(Icons.restaurant, color: moodColor, size: 32),
-                    ),
-                    const SizedBox(width: 16),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: moodColor,
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Text(
-                              '$mood MOOD RECIPE',
-                              style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            name,
-                            style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                
-                // Description
-                Text(
-                  description,
-                  style: TextStyle(fontSize: 14, color: Colors.grey[700], height: 1.5),
-                ),
-                const SizedBox(height: 20),
-                
-                // Nutrition Info
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: Colors.grey[50],
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: Colors.grey[200]!),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Nutrition Information',
-                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: moodColor),
-                      ),
-                      const SizedBox(height: 16),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceAround,
-                        children: [
-                          _buildNutritionItem('Calories', '$calories', 'kcal', Colors.orange),
-                          _buildNutritionItem('Protein', '$protein', 'g', Colors.red),
-                          _buildNutritionItem('Carbs', '$carbs', 'g', Colors.amber),
-                          _buildNutritionItem('Fat', '$fat', 'g', Colors.blue),
-                          _buildNutritionItem('Fiber', '$fiber', 'g', Colors.green),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 16),
-                
-                // Time info
-                if (prepTime.isNotEmpty || cookTime.isNotEmpty)
-                  Row(
-                    children: [
-                      if (prepTime.isNotEmpty)
-                        Expanded(
-                          child: Container(
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: Colors.blue[50],
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(Icons.schedule, color: Colors.blue[700], size: 20),
-                                const SizedBox(width: 8),
-                                Text('Prep: $prepTime', style: TextStyle(color: Colors.blue[700], fontWeight: FontWeight.w500)),
-                              ],
-                            ),
-                          ),
-                        ),
-                      if (prepTime.isNotEmpty && cookTime.isNotEmpty) const SizedBox(width: 12),
-                      if (cookTime.isNotEmpty)
-                        Expanded(
-                          child: Container(
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: Colors.orange[50],
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(Icons.restaurant, color: Colors.orange[700], size: 20),
-                                const SizedBox(width: 8),
-                                Text('Cook: $cookTime', style: TextStyle(color: Colors.orange[700], fontWeight: FontWeight.w500)),
-                              ],
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
-                const SizedBox(height: 24),
-                
-                // Ingredients
-                Text(
-                  'Ingredients',
-                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                    fontWeight: FontWeight.bold,
-                    color: moodColor,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                ...ingredients.map((ingredient) => Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
-                  child: Row(
-                    children: [
-                      Icon(Icons.check_circle, color: moodColor, size: 20),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(ingredient, style: const TextStyle(fontSize: 14)),
-                      ),
-                    ],
-                  ),
-                )).toList(),
-                const SizedBox(height: 24),
-                
-                // Instructions
-                Text(
-                  'Preparation Steps',
-                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                    fontWeight: FontWeight.bold,
-                    color: moodColor,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                ...instructions.asMap().entries.map((entry) => Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Container(
-                        width: 28,
-                        height: 28,
-                        decoration: BoxDecoration(
-                          color: moodColor.withOpacity(0.2),
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                        child: Center(
-                          child: Text(
-                            '${entry.key + 1}',
-                            style: TextStyle(fontWeight: FontWeight.bold, color: moodColor),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Text(entry.value, style: const TextStyle(fontSize: 14, height: 1.5)),
-                      ),
-                    ],
-                  ),
-                )).toList(),
-                const SizedBox(height: 24),
-                
-                // Health Benefits for PCOS
-                Text(
-                  'PCOS Health Benefits',
-                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                    fontWeight: FontWeight.bold,
-                    color: Colors.green[700],
-                  ),
-                ),
-                const SizedBox(height: 12),
-                ...benefits.map((benefit) => Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
-                  child: Row(
-                    children: [
-                      Icon(Icons.favorite, color: Colors.pink[400], size: 20),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(benefit, style: const TextStyle(fontSize: 14)),
-                      ),
-                    ],
-                  ),
-                )).toList(),
-                const SizedBox(height: 24),
-                
-                // Why this meal for your mood
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: moodColor.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: moodColor.withOpacity(0.3)),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Icon(Icons.lightbulb, color: moodColor),
-                          const SizedBox(width: 8),
-                          Text(
-                            'Why this meal for $mood mood?',
-                            style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: moodColor),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        _getMoodExplanation(mood),
-                        style: TextStyle(fontSize: 13, color: Colors.grey[700], height: 1.4),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 24),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildNutritionItem(String label, String value, String unit, Color color) {
-    return Column(
-      children: [
-        Text(value, style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: color)),
-        Text(unit, style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-        const SizedBox(height: 4),
-        Text(label, style: TextStyle(fontSize: 11, color: Colors.grey[700])),
-      ],
-    );
-  }
-
-  String _getMoodExplanation(String mood) {
-    switch (mood) {
-      case 'Happy':
-        return 'This balanced meal helps maintain your positive mood with complex carbohydrates for steady serotonin, omega-3s for brain health, and anti-inflammatory ingredients that support hormonal balance in PCOS.';
-      case 'Tired':
-        return 'This iron-rich meal combats fatigue common in PCOS. The complex carbohydrates provide sustained energy, while B-vitamins support cellular energy production. Perfect for restoring your vitality.';
-      case 'Anxious':
-        return 'This calming meal is rich in omega-3 fatty acids and magnesium, both shown to reduce anxiety and cortisol levels. The balanced nutrients help stabilize blood sugar, preventing mood fluctuations.';
-      case 'Sad':
-        return 'This mood-boosting meal contains omega-3s that support serotonin production, iron for energy, and magnesium for nerve function. These nutrients work together to naturally elevate your mood.';
-      case 'Energetic':
-        return 'This high-protein, balanced meal helps sustain your energy without excess. The combination of lean protein and complex carbs supports muscle recovery and helps maintain stable energy levels throughout the day.';
-      case 'Irritable':
-        return 'This blood sugar-stabilizing meal helps reduce irritability caused by glucose fluctuations. The magnesium-rich ingredients promote calm, while the balanced macros prevent mood swings.';
-      case 'Calm':
-        return 'This balanced maintenance meal supports your peaceful state with steady nutrients. The light, nutritious combination maintains stable energy and mood without overstimulation.';
-      case 'Stressed':
-        return 'This cortisol-lowering meal is packed with B-vitamins and magnesium to support your adrenal health. The omega-3s and fiber work to reduce inflammation and promote digestive calm during stressful times.';
-      case 'Neutral':
-        return 'This well-rounded meal provides balanced nutrition for everyday wellness. It includes all essential macronutrients and micronutrients to support overall health and PCOS management.';
-      default:
-        return 'This PCOS-friendly Filipino meal is designed to support your hormonal health with balanced macronutrients, anti-inflammatory ingredients, and blood sugar stabilizing properties.';
-    }
   }
 }
 
