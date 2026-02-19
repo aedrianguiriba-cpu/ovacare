@@ -3386,7 +3386,7 @@ Side effects:
                         children: [
                           Expanded(
                             child: DropdownButtonFormField<String>(
-                              value: selectedCategory,
+                              initialValue: selectedCategory,
                               decoration: InputDecoration(
                                 labelText: 'Category',
                                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
@@ -3400,7 +3400,7 @@ Side effects:
                           const SizedBox(width: 12),
                           Expanded(
                             child: DropdownButtonFormField<String>(
-                              value: selectedStatus,
+                              initialValue: selectedStatus,
                               decoration: InputDecoration(
                                 labelText: 'Status',
                                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
@@ -3478,7 +3478,7 @@ Side effects:
                             Switch(
                               value: isFeatured,
                               onChanged: (v) => setModalState(() => isFeatured = v),
-                              activeColor: Colors.amber[600],
+                              activeThumbColor: Colors.amber[600],
                             ),
                           ],
                         ),
@@ -3520,7 +3520,7 @@ Side effects:
                             
                             if (isEditing) {
                               setState(() {
-                                article!['title'] = titleController.text;
+                                article['title'] = titleController.text;
                                 article['author'] = authorController.text;
                                 article['journal'] = journalController.text;
                                 article['year'] = yearController.text;
@@ -3857,10 +3857,10 @@ class _NotificationManagementScreenState extends State<NotificationManagementScr
                           child: const Icon(Icons.create_rounded, color: Colors.white, size: 22),
                         ),
                         const SizedBox(width: 14),
-                        Expanded(
+                        const Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
-                            children: const [
+                            children: [
                               Text(
                                 'Compose New Notification',
                                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
@@ -4014,8 +4014,8 @@ class _NotificationManagementScreenState extends State<NotificationManagementScr
                                     _messageController.clear();
                                     ScaffoldMessenger.of(context).showSnackBar(
                                       SnackBar(
-                                        content: Row(
-                                          children: const [
+                                        content: const Row(
+                                          children: [
                                             Icon(Icons.check_circle_rounded, color: Colors.white),
                                             SizedBox(width: 12),
                                             Flexible(child: Text('Notification sent successfully!')),
@@ -5686,7 +5686,7 @@ class _DoctorManagementScreenState extends State<DoctorManagementScreen> {
                         children: [
                           Expanded(
                             child: DropdownButtonFormField<String>(
-                              value: specialtyController.text,
+                              initialValue: specialtyController.text,
                               decoration: InputDecoration(
                                 labelText: 'Specialty *',
                                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
@@ -5752,7 +5752,7 @@ class _DoctorManagementScreenState extends State<DoctorManagementScreen> {
                             Switch(
                               value: isPcosSpecialist,
                               onChanged: (v) => setModalState(() => isPcosSpecialist = v),
-                              activeColor: Colors.green[600],
+                              activeThumbColor: Colors.green[600],
                             ),
                           ],
                         ),
@@ -7669,7 +7669,7 @@ class _ProfileScreenState extends State<ProfileScreen> with SingleTickerProvider
                     Switch(
                       value: settings.allNotificationsEnabled,
                       onChanged: (value) => settings.setAllNotifications(value),
-                      activeColor: Colors.green,
+                      activeThumbColor: Colors.green,
                     ),
                   ],
                 ),
@@ -7793,7 +7793,7 @@ class _ProfileScreenState extends State<ProfileScreen> with SingleTickerProvider
           Switch(
             value: value,
             onChanged: onChanged,
-            activeColor: color,
+            activeThumbColor: color,
           ),
         ],
       ),
@@ -8059,7 +8059,7 @@ class _ProfileScreenState extends State<ProfileScreen> with SingleTickerProvider
           Switch(
             value: value,
             onChanged: onChanged,
-            activeColor: color,
+            activeThumbColor: color,
           ),
         ],
       ),

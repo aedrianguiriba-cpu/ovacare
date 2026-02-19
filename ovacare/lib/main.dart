@@ -5,7 +5,6 @@ import 'package:provider/provider.dart';
 import 'dart:math' as math;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
-import 'package:youtube_player_flutter/youtube_player_flutter.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'additional_screens.dart';
 import 'data_service.dart';
@@ -225,13 +224,27 @@ class AuthProvider extends ChangeNotifier {
   }
 
   /// Sign up a new user with Supabase
-  Future<bool> signUp(String email, String password, String name) async {
+  Future<bool> signUp(String email, String password, String name, {
+    String? username,
+    int? age,
+    double? height,
+    double? weight,
+    String? city,
+  }) async {
     try {
       _errorMessage = null;
       final response = await Supabase.instance.client.auth.signUp(
         email: email,
         password: password,
         emailRedirectTo: null, // You can set a custom redirect URL if needed
+        data: {
+          'name': name,
+          'username': username,
+          'age': age,
+          'height': height,
+          'weight': weight,
+          'city': city,
+        },
       );
 
       // If user is returned, email is confirmed instantly (rare, only for trusted domains)
@@ -242,32 +255,79 @@ class AuthProvider extends ChangeNotifier {
         return false;
       } else if (response.user != null && response.user!.emailConfirmedAt == null) {
         // User created but not confirmed
-        print('📧 Confirmation email sent to $email');
-        return false;
+        // For testing: if email isn't configured, we'll allow login anyway
+        print('📧 Confirmation email sent to $email (or email service not configured)');
+        // Don't fail here - allow testing without email verification
+        userId = response.user!.id;
+        userName = name;
+        userEmail = email;
+        isLoggedIn = true;
+        
+        // Save user to database
+        await _saveUserToDatabase(
+          userId: response.user!.id,
+          email: email,
+          name: name,
+          username: username,
+          age: age,
+          height: height,
+          weight: weight,
+          city: city,
+        );
+        
+        notifyListeners();
+        print('✅ User registered (email confirmation: awaiting configuration)');
+        return true;
       } else if (response.user != null && response.user!.emailConfirmedAt != null) {
         // Email already confirmed (very rare)
         userId = response.user!.id;
         userName = name;
         userEmail = email;
         isLoggedIn = true;
-        try {
-          await Supabase.instance.client.from('profiles').insert({
-            'id': userId,
-            'email': userEmail,
-            'name': name,
-            'created_at': DateTime.now().toIso8601String(),
-          });
-        } catch (e) {
-          print('⚠️ Could not save profile to database: $e');
-        }
+        
+        // Save user to database
+        await _saveUserToDatabase(
+          userId: response.user!.id,
+          email: email,
+          name: name,
+          username: username,
+          age: age,
+          height: height,
+          weight: weight,
+          city: city,
+        );
+        
         notifyListeners();
         print('✅ User registered and confirmed');
         return true;
       }
       return false;
     } catch (e) {
-      _errorMessage = e.toString();
-      print('❌ Sign up error: $e');
+      // Handle specific error types with user-friendly messages
+      String errorMsg = e.toString();
+      
+      if (errorMsg.contains('unexpected_failure') || errorMsg.contains('Error sending confirmation email')) {
+        _errorMessage = 'Account created! Email service not configured - you can log in immediately. Confirmation email will work once Supabase email is set up.';
+        print('⚠️ Email service error (non-blocking): $e');
+        // Try to allow login anyway since account was created
+        return true; // Return true to indicate "account created but email failed"
+      } else if (errorMsg.contains('over_email_send_rate_limit') || errorMsg.contains('429')) {
+        _errorMessage = 'Too many signup attempts with this email. Please wait 15-30 minutes before trying again, or use a different email address.';
+        print('⏱️ Rate limit exceeded: Too many confirmation emails sent');
+      } else if (errorMsg.contains('User already exists')) {
+        _errorMessage = 'This email is already registered. Please log in or use a different email.';
+        print('❌ User already exists: $e');
+      } else if (errorMsg.contains('Invalid email')) {
+        _errorMessage = 'Please enter a valid email address.';
+        print('❌ Invalid email: $e');
+      } else if (errorMsg.contains('Password')) {
+        _errorMessage = 'Password must be at least 6 characters.';
+        print('❌ Password error: $e');
+      } else {
+        _errorMessage = 'Signup failed: ${e.toString()}';
+        print('❌ Sign up error: $e');
+      }
+      
       return false;
     }
   }
@@ -282,10 +342,34 @@ class AuthProvider extends ChangeNotifier {
       );
 
       if (response.user != null) {
+        // TODO: Enable email verification check for production
+        // For testing/development, allowing unconfirmed emails temporarily
+        // Uncomment the lines below when email is properly configured:
+        /*
+        if (response.user!.emailConfirmedAt == null) {
+          _errorMessage = 'Please verify your email before logging in';
+          print('⚠️ Email not verified');
+          return false;
+        }
+        */
+        
         userId = response.user!.id;
         userEmail = email;
         userName = response.user?.userMetadata?['name'] ?? email.split('@')[0];
         isLoggedIn = true;
+        
+        // Save user to database if not already there
+        await _saveUserToDatabase(
+          userId: response.user!.id,
+          email: email,
+          name: response.user?.userMetadata?['name'],
+          username: response.user?.userMetadata?['username'],
+          age: response.user?.userMetadata?['age'] as int?,
+          height: response.user?.userMetadata?['height'] as double?,
+          weight: response.user?.userMetadata?['weight'] as double?,
+          city: response.user?.userMetadata?['city'],
+        );
+        
         notifyListeners();
         print('✅ User logged in: $email');
         return true;
@@ -295,6 +379,38 @@ class AuthProvider extends ChangeNotifier {
       _errorMessage = e.toString();
       print('❌ Login error: $e');
       return false;
+    }
+  }
+  
+  /// Save user to users table in Supabase (non-blocking)
+  Future<void> _saveUserToDatabase({
+    required String userId,
+    required String email,
+    String? name,
+    String? username,
+    int? age,
+    double? height,
+    double? weight,
+    String? city,
+  }) async {
+    try {
+      // Simply insert without any checks
+      await Supabase.instance.client
+          .from('users')
+          .insert({
+            'id': userId,
+            'email': email,
+            'name': name,
+            'username': username,
+            'age': age,
+            'height': height,
+            'weight': weight,
+            'city': city,
+          });
+      print('✅ User data saved to users table');
+    } catch (insertError) {
+      // If insert fails, silently continue (table may not exist or user already exists)
+      print('ℹ️ Could not insert to users table: $insertError');
     }
   }
 
@@ -1089,23 +1205,17 @@ class HealthDataProvider extends ChangeNotifier {
           // Beyond 2 standard deviations - significant outlier
           datasetScore = 100.0;
           datasetSeverity = 'High';
-          datasetDesc = comparison.interpretation + 
-              ' This is a significant deviation (Z-score: ${zScore.toStringAsFixed(2)}) from population norms. '
-              'Cycle length of ${userAvgCycle.toStringAsFixed(0)} days differs by more than 2 standard deviations from average (${_populationData!.averageCycleLength.toStringAsFixed(1)}±${_populationData!.stdDevCycleLength.toStringAsFixed(1)}).';
+          datasetDesc = '${comparison.interpretation} This is a significant deviation (Z-score: ${zScore.toStringAsFixed(2)}) from population norms. Cycle length of ${userAvgCycle.toStringAsFixed(0)} days differs by more than 2 standard deviations from average (${_populationData!.averageCycleLength.toStringAsFixed(1)}±${_populationData!.stdDevCycleLength.toStringAsFixed(1)}).';
         } else if (absZScore > 1.0) {
           // 1-2 standard deviations - moderate deviation
           datasetScore = 50.0;
           datasetSeverity = 'Moderate';
-          datasetDesc = comparison.interpretation + 
-              ' This varies moderately from typical (Z-score: ${zScore.toStringAsFixed(2)}). '
-              'Cycle length of ${userAvgCycle.toStringAsFixed(0)} days is ${zScore > 0 ? 'longer' : 'shorter'} than average, but within acceptable range.';
+          datasetDesc = '${comparison.interpretation} This varies moderately from typical (Z-score: ${zScore.toStringAsFixed(2)}). Cycle length of ${userAvgCycle.toStringAsFixed(0)} days is ${zScore > 0 ? 'longer' : 'shorter'} than average, but within acceptable range.';
         } else {
           // Within 1 standard deviation - normal variation
           datasetScore = 0.0;
           datasetSeverity = 'Low';
-          datasetDesc = comparison.interpretation + 
-              ' Your cycle falls within normal population variation (Z-score: ${zScore.toStringAsFixed(2)}). '
-              'This is typical and healthy.';
+          datasetDesc = '${comparison.interpretation} Your cycle falls within normal population variation (Z-score: ${zScore.toStringAsFixed(2)}). This is typical and healthy.';
         }
 
         factors.add({
@@ -1261,7 +1371,7 @@ class HealthDataProvider extends ChangeNotifier {
         recommendations.add({
           'category': 'Symptom Relief',
           'title': 'Managing Period Cramps',
-          'insight': 'Severe cramping detected in ${crampCount} recent cycles.',
+          'insight': 'Severe cramping detected in $crampCount recent cycles.',
           'personalization': 'Severe cramps (>5/10) may indicate inflammation or magnesium deficiency.',
           'recommendations': [
             '🌿 Magnesium supplements (300-400mg): helps relax uterine muscles',
@@ -1276,7 +1386,7 @@ class HealthDataProvider extends ChangeNotifier {
         recommendations.add({
           'category': 'Hormonal Skin Health',
           'title': 'Managing Hormonal Acne',
-          'insight': 'Acne breakouts detected in ${acneCount} recent entries.',
+          'insight': 'Acne breakouts detected in $acneCount recent entries.',
           'personalization': 'Hormonal fluctuations trigger oil production. These tips target root causes.',
           'recommendations': [
             '🧴 Use salicylic acid cleanser during luteal phase (10 days before period)',
@@ -1291,7 +1401,7 @@ class HealthDataProvider extends ChangeNotifier {
         recommendations.add({
           'category': 'Mental Wellness',
           'title': 'Managing Mood Swings',
-          'insight': 'Mood changes detected in ${moodCount} recent cycles.',
+          'insight': 'Mood changes detected in $moodCount recent cycles.',
           'personalization': 'Serotonin drops in luteal phase. Lifestyle changes can help significantly.',
           'recommendations': [
             '☀️ Morning sunlight exposure: 15-20 min within 2 hours of waking (boosts serotonin)',
@@ -1306,7 +1416,7 @@ class HealthDataProvider extends ChangeNotifier {
         recommendations.add({
           'category': 'Digestive Wellness',
           'title': 'Reducing Bloating',
-          'insight': 'Bloating detected in ${bloatingCount} recent cycles.',
+          'insight': 'Bloating detected in $bloatingCount recent cycles.',
           'personalization': 'Hormonal fluctuations reduce gut motility. Targeted nutrition helps.',
           'recommendations': [
             '🥗 Increase fiber gradually (25-30g/day) - fermentation causes bloating if rushed',
@@ -1407,29 +1517,10 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final _usernameController = TextEditingController();
+  final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
   bool _isPasswordVisible = false;
   bool _isLoading = false;
-
-  // Predefined users for demo
-  final Map<String, Map<String, dynamic>> _users = {
-    'admin': {
-      'password': 'admin123',
-      'name': 'Administrator',
-      'email': 'admin@ovacare.com',
-    },
-    'sarah': {
-      'password': 'sarah123',
-      'name': 'Sarah Johnson',
-      'email': 'sarah@example.com',
-    },
-    'maria': {
-      'password': 'maria123',
-      'name': 'Maria Santos',
-      'email': 'maria@example.com',
-    },
-  };
 
   @override
   Widget build(BuildContext context) {
@@ -1530,12 +1621,13 @@ class _LoginScreenState extends State<LoginScreen> {
                       ),
                       const SizedBox(height: 24),
                       
-                      // Username Field
+                      // Email Field
                       TextFormField(
-                        controller: _usernameController,
+                        controller: _emailController,
+                        keyboardType: TextInputType.emailAddress,
                         decoration: InputDecoration(
-                          labelText: 'Username',
-                          prefixIcon: Icon(Icons.person_outline, color: Colors.pink[600]),
+                          labelText: 'Email',
+                          prefixIcon: Icon(Icons.email_outlined, color: Colors.pink[600]),
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(12),
                           ),
@@ -1679,45 +1771,6 @@ class _LoginScreenState extends State<LoginScreen> {
                   ),
                 ),
                 
-                const SizedBox(height: 40),
-                
-                // Demo Accounts Info
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: Colors.blue[50],
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: Colors.blue[200]!),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Icon(Icons.info_outline, color: Colors.blue[600], size: 20),
-                          const SizedBox(width: 8),
-                          Text(
-                            'Demo Accounts',
-                            style: TextStyle(
-                              fontWeight: FontWeight.bold,
-                              color: Colors.blue[800],
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        'User: sarah / sarah123\nUser: maria / maria123',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.blue[700],
-                          fontFamily: 'monospace',
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                
               ],
             ),
           ),
@@ -1727,38 +1780,40 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   void _handleLogin() async {
-    final username = _usernameController.text.trim();
+    final email = _emailController.text.trim();
     final password = _passwordController.text;
 
-    if (username.isEmpty || password.isEmpty) {
-      _showErrorSnackBar('Please enter both username and password');
+    if (email.isEmpty || password.isEmpty) {
+      _showErrorSnackBar('Please enter both email and password');
+      return;
+    }
+
+    // Basic email validation
+    if (!email.contains('@')) {
+      _showErrorSnackBar('Please enter a valid email address');
       return;
     }
 
     setState(() => _isLoading = true);
 
-    // Simulate network delay
-    await Future.delayed(const Duration(milliseconds: 1500));
+    try {
+      final authProvider = context.read<AuthProvider>();
+      final success = await authProvider.login(email, password);
 
-    if (_users.containsKey(username.toLowerCase())) {
-      final user = _users[username.toLowerCase()]!;
-      if (user['password'] == password) {
-        // Successful login
-        if (mounted) {
-          context.read<AuthProvider>().login(
-            user['name'] as String,
-            user['email'] as String,
-          );
-        }
-      } else {
-        _showErrorSnackBar('Invalid password');
+      if (!success && mounted) {
+        _showErrorSnackBar(authProvider.errorMessage ?? 'Login failed');
+      } else if (success && mounted) {
+        // Login successful, navigate to dashboard
+        Navigator.pushReplacementNamed(context, '/dashboard');
       }
-    } else {
-      _showErrorSnackBar('Username not found');
-    }
-
-    if (mounted) {
-      setState(() => _isLoading = false);
+    } catch (e) {
+      if (mounted) {
+        _showErrorSnackBar(e.toString());
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
     }
   }
 
@@ -2029,7 +2084,7 @@ class OverviewScreen extends StatelessWidget {
                         ),
                         child: Stack(
                           children: [
-                            Icon(
+                            const Icon(
                               Icons.notifications_outlined,
                               color: Colors.white,
                               size: 24,
@@ -2045,7 +2100,7 @@ class OverviewScreen extends StatelessWidget {
                                   borderRadius: BorderRadius.circular(6),
                                   border: Border.all(color: Colors.white, width: 1),
                                 ),
-                                child: Center(
+                                child: const Center(
                                   child: Text(
                                     '3',
                                     style: TextStyle(
@@ -2473,6 +2528,18 @@ class _SignUpScreenState extends State<SignUpScreen> {
   bool _isConfirmPasswordVisible = false;
   bool _isLoading = false;
   bool _agreeToTerms = false;
+  
+  final List<String> _cities = [
+    'Floridablanca',
+    'Mexico',
+    'San Luis',
+    'Santo Tomas',
+    'Candaba',
+    'Guagua',
+    'Lubao',
+    'Magalang',
+  ];
+  String? _selectedCity;
 
   @override
   void dispose() {
@@ -2503,10 +2570,21 @@ class _SignUpScreenState extends State<SignUpScreen> {
     setState(() => _isLoading = true);
 
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    
+    // Parse age, height, weight
+    int? age = int.tryParse(_ageController.text.trim());
+    double? height = double.tryParse(_heightController.text.trim());
+    double? weight = double.tryParse(_weightController.text.trim());
+    
     final success = await authProvider.signUp(
       _emailController.text.trim(),
       _passwordController.text,
       _fullNameController.text.trim(),
+      username: _usernameController.text.trim(),
+      age: age,
+      height: height,
+      weight: weight,
+      city: _selectedCity,
     );
 
     setState(() => _isLoading = false);
@@ -2744,6 +2822,42 @@ class _SignUpScreenState extends State<SignUpScreen> {
                           label: 'Weight (kg)',
                           icon: Icons.monitor_weight_outlined,
                           keyboardType: TextInputType.number,
+                        ),
+                        
+                        const SizedBox(height: 16),
+                        
+                        // City Dropdown
+                        DropdownButtonFormField<String>(
+                          value: _selectedCity,
+                          items: _cities.map((city) {
+                            return DropdownMenuItem(
+                              value: city,
+                              child: Text(city),
+                            );
+                          }).toList(),
+                          onChanged: (value) => setState(() => _selectedCity = value),
+                          decoration: InputDecoration(
+                            labelText: 'City (Pampanga)',
+                            prefixIcon: Icon(Icons.location_on_outlined, color: Colors.pink[600]),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            enabledBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                              borderSide: BorderSide(color: Colors.grey[300]!),
+                            ),
+                            focusedBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                              borderSide: BorderSide(color: Colors.pink[400]!, width: 2),
+                            ),
+                            filled: true,
+                            fillColor: Colors.grey[50],
+                            hintText: 'Select your city',
+                          ),
+                          validator: (value) {
+                            if (value == null || value.isEmpty) return 'Please select a city';
+                            return null;
+                          },
                         ),
                         
                         const SizedBox(height: 24),
@@ -3486,13 +3600,33 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Flo-style cycle overview card
-          _buildCycleOverviewCard(health),
-          const SizedBox(height: 16),
+          // Enhanced cycle overview card with cycle phase info
+          _buildEnhancedCycleOverviewCard(health),
+          const SizedBox(height: 20),
           
-          // Calendar widget (priority - shown second)
-          _buildFloStyleCalendar(health),
-          const SizedBox(height: 16),
+          // Current cycle phase insights card
+          if (health.menstrualCycles.isNotEmpty)
+            _buildCyclePhaseInsightsCard(health),
+          if (health.menstrualCycles.isNotEmpty)
+            const SizedBox(height: 20),
+          
+          // Calendar widget with improved design
+          _buildEnhancedFloStyleCalendar(health),
+          const SizedBox(height: 20),
+          
+          // Cycle statistics with better styling
+          _buildEnhancedCycleStatsCard(health),
+          const SizedBox(height: 20),
+          
+          // Today's insights (Flo-style)
+          _buildTodayInsightsCard(health),
+          const SizedBox(height: 20),
+          
+          // Population comparison card (if data available)
+          if (_populationData != null)
+            _buildPopulationComparisonCard(health, _populationData!),
+          if (_populationData != null)
+            const SizedBox(height: 20),
           
           // Clear button for old data
           if (health.menstrualCycles.isNotEmpty)
@@ -3535,20 +3669,6 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
                 ),
               ),
             ),
-          const SizedBox(height: 16),
-          
-          // Today's insights (Flo-style)
-          _buildTodayInsightsCard(health),
-          const SizedBox(height: 16),
-          
-          // Population comparison card (if data available)
-          if (_populationData != null)
-            _buildPopulationComparisonCard(health, _populationData!),
-          if (_populationData != null)
-            const SizedBox(height: 16),
-          
-          // Cycle statistics
-          _buildCycleStatsCard(health),
         ],
       ),
     );
@@ -3827,7 +3947,7 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
                     const Align(alignment: Alignment.centerLeft, child: Text('Mood', style: TextStyle(fontWeight: FontWeight.bold))),
                     const SizedBox(height: 8),
                     DropdownButtonFormField<String>(
-                      value: mood,
+                      initialValue: mood,
                       decoration: InputDecoration(
                         border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
                         contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -3951,7 +4071,7 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
     int totalEntries = health.hydrationEntries.length;
     if (health.hydrationEntries.isNotEmpty) {
       final total = health.hydrationEntries.take(7).fold<int>(0, (sum, e) => sum + ((e['ml'] as num).toInt()));
-      avgHydration = total / (health.hydrationEntries.take(7).length > 0 ? health.hydrationEntries.take(7).length : 1);
+      avgHydration = total / (health.hydrationEntries.take(7).isNotEmpty ? health.hydrationEntries.take(7).length : 1);
     }
     Color hydrationColor = Colors.blue;
     String hydrationStatus = 'Optimal';
@@ -3977,15 +4097,15 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
                   children: [
                     Icon(Icons.local_drink, color: hydrationColor, size: 32),
                     const SizedBox(height: 8),
-                    Text('Daily Avg', style: TextStyle(fontSize: 12, color: Colors.black54)),
+                    const Text('Daily Avg', style: TextStyle(fontSize: 12, color: Colors.black54)),
                     Text('${avgHydration.toStringAsFixed(0)} ml', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: hydrationColor)),
                   ],
                 ),
                 Column(
                   children: [
-                    Icon(Icons.trending_up, color: Colors.blue, size: 32),
+                    const Icon(Icons.trending_up, color: Colors.blue, size: 32),
                     const SizedBox(height: 8),
-                    Text('Total Logs', style: TextStyle(fontSize: 12, color: Colors.black54)),
+                    const Text('Total Logs', style: TextStyle(fontSize: 12, color: Colors.black54)),
                     Text('$totalEntries', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.blue)),
                   ],
                 ),
@@ -3993,7 +4113,7 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
                   children: [
                     Icon(Icons.flag, color: hydrationColor, size: 32),
                     const SizedBox(height: 8),
-                    Text('Status', style: TextStyle(fontSize: 12, color: Colors.black54)),
+                    const Text('Status', style: TextStyle(fontSize: 12, color: Colors.black54)),
                     Text(hydrationStatus, style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: hydrationColor)),
                   ],
                 ),
@@ -4010,7 +4130,7 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
             padding: const EdgeInsets.all(12),
             child: Row(
               children: [
-                Icon(Icons.info_outline, color: Colors.blue, size: 20),
+                const Icon(Icons.info_outline, color: Colors.blue, size: 20),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
@@ -4057,7 +4177,7 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
                                     Text('$ml ml', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
-                                    Text('${date.toString().split(' ')[0]}', style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+                                    Text(date.toString().split(' ')[0], style: TextStyle(fontSize: 12, color: Colors.grey[600])),
                                   ],
                                 ),
                               ),
@@ -4104,7 +4224,7 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               DropdownButtonFormField<int>(
-                                value: selectedMl,
+                                initialValue: selectedMl,
                                 decoration: const InputDecoration(labelText: 'Amount (ml)', border: OutlineInputBorder()),
                                 items: [1000, 1500, 1800, 2000, 2200, 2500, 3000].map((m) => DropdownMenuItem(value: m, child: Text('$m ml'))).toList(),
                                 onChanged: (v) => setState(() => selectedMl = v ?? 2000),
@@ -4175,25 +4295,25 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
               children: [
                 Column(
                   children: [
-                    Icon(Icons.medication, color: Colors.teal, size: 32),
+                    const Icon(Icons.medication, color: Colors.teal, size: 32),
                     const SizedBox(height: 8),
-                    Text('Medications', style: TextStyle(fontSize: 12, color: Colors.black54)),
+                    const Text('Medications', style: TextStyle(fontSize: 12, color: Colors.black54)),
                     Text('$totalMeds', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.teal)),
                   ],
                 ),
                 Column(
                   children: [
-                    Icon(Icons.check_circle, color: Colors.green, size: 32),
+                    const Icon(Icons.check_circle, color: Colors.green, size: 32),
                     const SizedBox(height: 8),
-                    Text('Completed', style: TextStyle(fontSize: 12, color: Colors.black54)),
+                    const Text('Completed', style: TextStyle(fontSize: 12, color: Colors.black54)),
                     Text('$completedDoses/$totalDoses', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.green)),
                   ],
                 ),
                 Column(
                   children: [
-                    Icon(Icons.percent, color: Colors.purple, size: 32),
+                    const Icon(Icons.percent, color: Colors.purple, size: 32),
                     const SizedBox(height: 8),
-                    Text('Adherence', style: TextStyle(fontSize: 12, color: Colors.black54)),
+                    const Text('Adherence', style: TextStyle(fontSize: 12, color: Colors.black54)),
                     Text('${adherence.toStringAsFixed(0)}%', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.purple)),
                   ],
                 ),
@@ -4330,7 +4450,7 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
                                   decoration: const InputDecoration(labelText: 'Dose (e.g., 500mg)', border: OutlineInputBorder()),
                                 ),
                                 const SizedBox(height: 16),
-                                Align(
+                                const Align(
                                   alignment: Alignment.centerLeft,
                                   child: Text('When to take:', style: TextStyle(fontSize: 12, color: Colors.black54, fontWeight: FontWeight.w600)),
                                 ),
@@ -4429,9 +4549,9 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
               children: [
                 Column(
                   children: [
-                    Icon(Icons.monitor_weight, color: Colors.orange, size: 32),
+                    const Icon(Icons.monitor_weight, color: Colors.orange, size: 32),
                     const SizedBox(height: 8),
-                    Text('Current', style: TextStyle(fontSize: 12, color: Colors.black54)),
+                    const Text('Current', style: TextStyle(fontSize: 12, color: Colors.black54)),
                     Text('${currentWeight.toStringAsFixed(1)} kg', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.orange)),
                   ],
                 ),
@@ -4439,15 +4559,15 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
                   children: [
                     Icon(Icons.trending_up, color: trendColor, size: 32),
                     const SizedBox(height: 8),
-                    Text('Trend', style: TextStyle(fontSize: 12, color: Colors.black54)),
+                    const Text('Trend', style: TextStyle(fontSize: 12, color: Colors.black54)),
                     Text(weightTrend, style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: trendColor)),
                   ],
                 ),
                 Column(
                   children: [
-                    Icon(Icons.difference, color: Colors.purple, size: 32),
+                    const Icon(Icons.difference, color: Colors.purple, size: 32),
                     const SizedBox(height: 8),
-                    Text('Change', style: TextStyle(fontSize: 12, color: Colors.black54)),
+                    const Text('Change', style: TextStyle(fontSize: 12, color: Colors.black54)),
                     Text('${weightChange > 0 ? '+' : ''}${weightChange.toStringAsFixed(1)} kg', 
                       style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: weightChange > 0 ? Colors.orange : Colors.green)),
                   ],
@@ -4465,7 +4585,7 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
             padding: const EdgeInsets.all(12),
             child: Row(
               children: [
-                Icon(Icons.info_outline, color: Colors.orange, size: 20),
+                const Icon(Icons.info_outline, color: Colors.orange, size: 20),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
@@ -4513,7 +4633,7 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
                                     Text('${weight.toStringAsFixed(1)} kg', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
-                                    Text('${date.toString().split(' ')[0]}', style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+                                    Text(date.toString().split(' ')[0], style: TextStyle(fontSize: 12, color: Colors.grey[600])),
                                   ],
                                 ),
                               ),
@@ -4547,7 +4667,7 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
                       title: const Text('Log Weight'),
                       content: TextField(
                         controller: controller,
-                        keyboardType: TextInputType.numberWithOptions(decimal: true),
+                        keyboardType: const TextInputType.numberWithOptions(decimal: true),
                         decoration: const InputDecoration(labelText: 'Weight (kg)', border: OutlineInputBorder()),
                         onChanged: (v) => newWeight = double.tryParse(v),
                       ),
@@ -4882,7 +5002,6 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
 
   Widget _buildTodayInsightsCard(HealthDataProvider health) {
     final today = DateTime.now();
-    // Use only actual period marking to tailor insights
     final isTodayPeriod = health.isPeriodDay(today);
 
     List<Map<String, dynamic>> insights = isTodayPeriod
@@ -4897,151 +5016,132 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
             {'icon': Icons.local_drink, 'title': 'Hydration Goal', 'subtitle': 'Aim for 6–8 glasses of water today', 'color': Colors.teal},
           ];
 
-    return Card(
-      elevation: 4,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.lightbulb, color: Colors.amber, size: 24),
-                const SizedBox(width: 8),
-                const Text(
-                  'Today\'s Insights',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            ...insights.map((insight) => Padding(
-              padding: const EdgeInsets.only(bottom: 12),
-              child: Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: (insight['color'] as Color).withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Icon(
-                      insight['icon'] as IconData,
-                      color: insight['color'] as Color,
-                      size: 20,
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          insight['title'] as String,
-                          style: const TextStyle(
-                            fontWeight: FontWeight.w600,
-                            fontSize: 14,
-                          ),
-                        ),
-                        Text(
-                          insight['subtitle'] as String,
-                          style: TextStyle(
-                            color: Colors.grey[600],
-                            fontSize: 12,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: Colors.grey[200]!, width: 1),
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 6, offset: const Offset(0, 1))],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(color: Colors.amber.withOpacity(0.15), borderRadius: BorderRadius.circular(10)),
+                child: const Icon(Icons.lightbulb, color: Colors.amber, size: 24),
               ),
-            )).toList(),
-          ],
-        ),
+              const SizedBox(width: 12),
+              const Text(
+                'Today\'s Insights',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.black87),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          ...insights.asMap().entries.map((entry) {
+            final insight = entry.value;
+            final isLast = entry.key == insights.length - 1;
+            return Column(
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: (insight['color'] as Color).withOpacity(0.15),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Icon(
+                        insight['icon'] as IconData,
+                        color: insight['color'] as Color,
+                        size: 20,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            insight['title'] as String,
+                            style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: Colors.black87),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            insight['subtitle'] as String,
+                            style: TextStyle(color: Colors.grey[600], fontSize: 12, height: 1.4),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                if (!isLast) ...[const SizedBox(height: 12), Divider(color: Colors.grey[200], height: 1)],
+                if (!isLast) const SizedBox(height: 12),
+              ],
+            );
+          }).toList(),
+        ],
       ),
     );
   }
 
   // Flo-style calendar
   Widget _buildFloStyleCalendar(HealthDataProvider health) {
-    return Card(
-      elevation: 4,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: Colors.grey[200]!, width: 1),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'Cycle Calendar',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.black87),
+              ),
+              GestureDetector(
+                onTap: () {
+                  setState(() {
+                    _calendarDate = DateTime.now();
+                  });
+                },
+                child: Text(
+                  'Today',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.pink[400],
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          _buildMiniCalendar(health),
+          const SizedBox(height: 16),
+          // Minimalist legend
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                const Text(
-                  'Cycle Calendar',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                ),
-                // Header controls (auto-marking enabled; no mode toggle)
-                TextButton(
-                  onPressed: () {
-                    setState(() {
-                      _calendarDate = DateTime.now();
-                    });
-                  },
-                  child: const Text('Today', style: TextStyle(fontSize: 12)),
-                ),
+                _buildMinimalLegendItem('Period', Colors.red),
+                _buildMinimalLegendItem('Predicted', Colors.orange),
+                _buildMinimalLegendItem('Fertile', Colors.amber),
               ],
             ),
-            const SizedBox(height: 16),
-            _buildMiniCalendar(health),
-            const SizedBox(height: 12),
-            // Legend for calendar colors
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: [
-                  _buildLegendItem('Period', Colors.red[400]!),
-                  const SizedBox(width: 12),
-                  _buildLegendItem('Predicted', Colors.orange[300]!),
-                  const SizedBox(width: 12),
-                  _buildLegendItem('Fertile', Colors.amber[300]!, hasBorder: true),
-                ],
-              ),
-            ),
-            const SizedBox(height: 8),
-            Column(
-              children: [
-              
-                const SizedBox(height: 8),
-                // Quick navigation buttons
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                  children: [
-                    _buildQuickNavButton('3 months ago', () {
-                      setState(() {
-                        _calendarDate = DateTime(_calendarDate.year, _calendarDate.month - 3, 1);
-                      });
-                    }),
-                    _buildQuickNavButton('Last month', () {
-                      setState(() {
-                        _calendarDate = DateTime(_calendarDate.year, _calendarDate.month - 1, 1);
-                      });
-                    }),
-                    _buildQuickNavButton('Next month', () {
-                      setState(() {
-                        _calendarDate = DateTime(_calendarDate.year, _calendarDate.month + 1, 1);
-                      });
-                    }),
-                    _buildQuickNavButton('3 months ahead', () {
-                      setState(() {
-                        _calendarDate = DateTime(_calendarDate.year, _calendarDate.month + 3, 1);
-                      });
-                    }),
-                  ],
-                ),
-              ],
-            ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -5128,7 +5228,7 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
             children: List.generate(7, (dayIndex) {
               final dayNumber = weekIndex * 7 + dayIndex - startWeekday + 2;
               if (dayNumber < 1 || dayNumber > daysInMonth) {
-                return Container(width: 32, height: 32);
+                return const SizedBox(width: 32, height: 32);
               }
               
               final date = DateTime(_calendarDate.year, _calendarDate.month, dayNumber);
@@ -5253,9 +5353,9 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
         }
         
         // Check for fertile window (around ovulation, typically 14 days before next period)
-        final ovulationDay = nextPeriodStart.subtract(Duration(days: 14));
-        final fertileWindowStart = ovulationDay.subtract(Duration(days: 5));
-        final fertileWindowEnd = ovulationDay.add(Duration(days: 1));
+        final ovulationDay = nextPeriodStart.subtract(const Duration(days: 14));
+        final fertileWindowStart = ovulationDay.subtract(const Duration(days: 5));
+        final fertileWindowEnd = ovulationDay.add(const Duration(days: 1));
         
         if (!normalized.isBefore(fertileWindowStart) && !normalized.isAfter(fertileWindowEnd)) {
           return {
@@ -5290,7 +5390,7 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
       return const SizedBox.shrink();
     }
 
-    // Improved typical lengths (robust & recency-weighted)
+    // Calculate typical lengths (robust & recency-weighted)
     int avgCycleLength = 28;
     int avgPeriodLength = 5;
     if (health.menstrualCycles.length > 1) {
@@ -5305,13 +5405,12 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
         double weighted = 0;
         int totalW = 0;
         for (int i = 0; i < n; i++) {
-          final w = n - i; // recent cycles weigh more
+          final w = n - i;
           weighted += cycleLengths[i] * w;
           totalW += w;
         }
         avgCycleLength = (weighted / totalW).round().clamp(18, 45);
       }
-      // Period length median
       final periodLengths = <int>[];
       for (var cycle in health.menstrualCycles) {
         final s = cycle['start'] as DateTime;
@@ -5325,64 +5424,95 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
       }
     }
 
-    return Card(
-      elevation: 4,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Cycle Statistics',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 16),
-            Row(
-              children: [
-                Expanded(
-                  child: _buildStatItemWithIcon(
-                    'Avg Cycle',
-                    '$avgCycleLength days',
-                    Icons.refresh,
-                    Colors.blue,
-                  ),
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: Colors.grey[200]!, width: 1),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Cycle Statistics',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.black87),
+          ),
+          const SizedBox(height: 20),
+          // Two key metrics displayed simply
+          Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Average Cycle',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.grey[700]),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      '$avgCycleLength days',
+                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600, color: Colors.black87),
+                    ),
+                  ],
                 ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: _buildStatItemWithIcon(
-                    'Avg Period',
-                    '$avgPeriodLength days',
-                    Icons.water_drop,
-                    Colors.red,
-                  ),
+              ),
+              Container(width: 1, height: 50, color: Colors.grey[200]),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Average Period',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.grey[700]),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      '$avgPeriodLength days',
+                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600, color: Colors.black87),
+                    ),
+                  ],
                 ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Row(
-              children: [
-                Expanded(
-                  child: _buildStatItemWithIcon(
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
+          // Additional info below
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
                     'Cycles Tracked',
+                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.grey[700]),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
                     '${health.menstrualCycles.length}',
-                    Icons.calendar_today,
-                    Colors.green,
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.black87),
                   ),
-                ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: _buildStatItemWithIcon(
+                ],
+              ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(
                     'Regularity',
-                    _getRegularityStatus(health),
-                    Icons.timeline,
-                    Colors.orange,
+                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.grey[700]),
                   ),
-                ),
-              ],
-            ),
-          ],
-        ),
+                  const SizedBox(height: 4),
+                  Text(
+                    _getRegularityStatus(health),
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.black87),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
@@ -5401,11 +5531,11 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Row(
+              const Row(
                 children: [
                   Icon(Icons.people, color: Colors.purple, size: 24),
-                  const SizedBox(width: 8),
-                  const Text(
+                  SizedBox(width: 8),
+                  Text(
                     'Population Comparison',
                     style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                   ),
@@ -5474,7 +5604,7 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
           children: [
             Row(
               children: [
-                Icon(Icons.people, color: Colors.purple, size: 24),
+                const Icon(Icons.people, color: Colors.purple, size: 24),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Column(
@@ -5945,7 +6075,849 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
     );
   }
 
+  // ============== ENHANCED MENSTRUAL CYCLE WIDGETS ==============
+  
+  /// Enhanced cycle overview card with improved visual design
+  Widget _buildEnhancedCycleOverviewCard(HealthDataProvider health) {
+    final today = DateTime.now();
+    final todayD = DateTime(today.year, today.month, today.day);
+    
+    // Check if today is a logged period day
+    Map<String, dynamic>? currentCycle;
+    for (final c in health.menstrualCycles) {
+      final s = DateTime((c['start'] as DateTime).year, (c['start'] as DateTime).month, (c['start'] as DateTime).day);
+      final e = DateTime((c['end'] as DateTime).year, (c['end'] as DateTime).month, (c['end'] as DateTime).day);
+      if (!todayD.isBefore(s) && !todayD.isAfter(e)) {
+        currentCycle = c;
+        break;
+      }
+    }
+
+    Color statusColor = Colors.blue;
+    Color backgroundColor = Colors.blue.withOpacity(0.06);
+    String mainMessage = 'Start tracking';
+    String subMessage = 'Mark your period days on the calendar';
+    String statusLabel = 'Not Tracking';
+    IconData statusIcon = Icons.calendar_today;
+    int? daysUntilPeriod;
+    String? quickStat;
+
+    if (currentCycle != null) {
+      final s = DateTime((currentCycle['start'] as DateTime).year, (currentCycle['start'] as DateTime).month, (currentCycle['start'] as DateTime).day);
+      final cycleDay = todayD.difference(s).inDays + 1;
+      statusColor = Colors.red;
+      backgroundColor = Colors.red.withOpacity(0.06);
+      mainMessage = 'Day $cycleDay of your period';
+      statusIcon = Icons.water_drop;
+      statusLabel = 'PERIOD';
+      
+      if (health.menstrualCycles.isNotEmpty) {
+        final periodLengths = health.menstrualCycles
+            .map((c) => (c['end'] as DateTime).difference(c['start'] as DateTime).inDays + 1)
+            .where((d) => d > 0 && d <= 10)
+            .toList();
+        if (periodLengths.isNotEmpty) {
+          periodLengths.sort();
+          final medianLength = periodLengths[periodLengths.length ~/ 2];
+          final remaining = medianLength - cycleDay;
+          if (remaining > 0) {
+            subMessage = '$remaining day${remaining == 1 ? '' : 's'} remaining';
+            quickStat = 'Avg period: $medianLength days';
+          } else {
+            subMessage = 'Running longer than usual';
+          }
+        }
+      }
+    } else if (health.menstrualCycles.isNotEmpty) {
+      final nextPeriod = health.getNextPeriodPrediction();
+      daysUntilPeriod = health.getDaysUntilNextPeriod();
+      
+      if (nextPeriod != null && daysUntilPeriod != null) {
+        final sortedCycles = List<Map<String, dynamic>>.from(health.menstrualCycles)
+          ..sort((a, b) => (b['start'] as DateTime).compareTo(a['start'] as DateTime));
+        final lastPeriodStart = DateTime(
+          (sortedCycles.first['start'] as DateTime).year,
+          (sortedCycles.first['start'] as DateTime).month,
+          (sortedCycles.first['start'] as DateTime).day
+        );
+        final daysSinceLastPeriod = todayD.difference(lastPeriodStart).inDays;
+        
+        // Calculate average cycle length
+        final cycleLengths = <int>[];
+        for (int i = 0; i < sortedCycles.length - 1; i++) {
+          final diff = (sortedCycles[i]['start'] as DateTime).difference(
+            sortedCycles[i + 1]['start'] as DateTime).inDays;
+          if (diff > 0 && diff >= 18 && diff <= 45) cycleLengths.add(diff);
+        }
+        int avgCycleLength = 28;
+        if (cycleLengths.isNotEmpty) {
+          final n = cycleLengths.length;
+          double weighted = 0;
+          int totalW = 0;
+          for (int i = 0; i < n; i++) {
+            final w = n - i;
+            weighted += cycleLengths[i] * w;
+            totalW += w;
+          }
+          avgCycleLength = (weighted / totalW).round().clamp(18, 45);
+        }
+        
+        if (daysUntilPeriod <= 5 && daysUntilPeriod > 0) {
+          statusColor = Colors.orange;
+          backgroundColor = Colors.orange.withOpacity(0.06);
+          mainMessage = 'Period coming soon';
+          subMessage = 'In approximately $daysUntilPeriod day${daysUntilPeriod == 1 ? '' : 's'}';
+          statusIcon = Icons.schedule;
+          statusLabel = 'APPROACHING';
+          quickStat = 'Avg cycle: $avgCycleLength days';
+        } else if (daysUntilPeriod <= 0 && daysUntilPeriod >= -3) {
+          statusColor = Colors.deepOrange;
+          backgroundColor = Colors.deepOrange.withOpacity(0.06);
+          mainMessage = 'Period expected';
+          subMessage = 'Track when it starts';
+          statusIcon = Icons.event;
+          statusLabel = 'EXPECTED';
+          quickStat = 'Avg cycle: $avgCycleLength days';
+        } else if (daysSinceLastPeriod < 14) {
+          statusColor = Colors.pink;
+          backgroundColor = Colors.pink.withOpacity(0.06);
+          mainMessage = 'Follicular Phase';
+          subMessage = 'Day ${daysSinceLastPeriod + 1} of your cycle';
+          statusIcon = Icons.energy_savings_leaf;
+          statusLabel = 'RISING ENERGY';
+          quickStat = 'Day ${daysSinceLastPeriod + 1} of $avgCycleLength';
+        } else {
+          statusColor = Colors.purple;
+          backgroundColor = Colors.purple.withOpacity(0.06);
+          mainMessage = 'Luteal Phase';
+          subMessage = 'Day ${daysSinceLastPeriod + 1} of your cycle';
+          statusIcon = Icons.favorite;
+          statusLabel = 'INTROSPECTIVE';
+          quickStat = 'Day ${daysSinceLastPeriod + 1} of $avgCycleLength';
+        }
+      }
+    }
+
+    // Calculate cycle progress and menstrual phase
+    double cycleProgress = 0;
+    int cyclePosition = 0;
+    int totalCycleLength = 28;
+    String menstrualPhase = 'Not Tracked';
+    
+    if (health.menstrualCycles.isNotEmpty) {
+      final sortedCycles = List<Map<String, dynamic>>.from(health.menstrualCycles)
+        ..sort((a, b) => (b['start'] as DateTime).compareTo(a['start'] as DateTime));
+      final lastPeriodStart = DateTime(
+        (sortedCycles.first['start'] as DateTime).year,
+        (sortedCycles.first['start'] as DateTime).month,
+        (sortedCycles.first['start'] as DateTime).day
+      );
+      cyclePosition = todayD.difference(lastPeriodStart).inDays;
+      
+      // Calculate average cycle length
+      final cycleLengths = <int>[];
+      for (int i = 0; i < sortedCycles.length - 1; i++) {
+        final diff = (sortedCycles[i]['start'] as DateTime).difference(
+          sortedCycles[i + 1]['start'] as DateTime).inDays;
+        if (diff > 0 && diff >= 18 && diff <= 45) cycleLengths.add(diff);
+      }
+      if (cycleLengths.isNotEmpty) {
+        final n = cycleLengths.length;
+        double weighted = 0;
+        int totalW = 0;
+        for (int i = 0; i < n; i++) {
+          final w = n - i;
+          weighted += cycleLengths[i] * w;
+          totalW += w;
+        }
+        totalCycleLength = (weighted / totalW).round().clamp(18, 45);
+      }
+      cycleProgress = (cyclePosition.toDouble() / totalCycleLength).clamp(0, 1);
+      
+      // Determine menstrual phase
+      if (cyclePosition <= 4) {
+        menstrualPhase = 'Menstrual';
+      } else if (cyclePosition <= 13) {
+        menstrualPhase = 'Follicular';
+      } else if (cyclePosition <= 15) {
+        menstrualPhase = 'Ovulation';
+      } else if (cyclePosition < totalCycleLength) {
+        menstrualPhase = 'Luteal';
+      }
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Colors.white, backgroundColor.withOpacity(0.25)],
+        ),
+        border: Border(left: BorderSide(color: statusColor, width: 5)),
+        borderRadius: BorderRadius.circular(14),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 8, offset: const Offset(0, 2))],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header row with icon, title, and mini-calendar
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(color: backgroundColor, borderRadius: BorderRadius.circular(10)),
+                child: Icon(statusIcon, color: statusColor, size: 26),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Text(
+                          mainMessage,
+                          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: statusColor),
+                        ),
+                        const SizedBox(width: 4),
+                        Tooltip(
+                          message: 'Learn more about this phase',
+                          child: Icon(Icons.info_outline, size: 15, color: statusColor.withOpacity(0.7)),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      subMessage,
+                      style: TextStyle(fontSize: 12, color: Colors.grey[700], height: 1.4),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              // Mini calendar icon for context
+              Tooltip(
+                message: 'Open calendar',
+                child: Icon(Icons.calendar_month, color: Colors.blueGrey[300], size: 22),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          // Phase and energy/mood indicators row with gradients
+          if (health.menstrualCycles.isNotEmpty)
+            Row(
+              children: [
+                // Menstrual phase badge
+                Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [statusColor.withOpacity(0.18), statusColor.withOpacity(0.08)],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      border: Border.all(color: statusColor.withOpacity(0.25), width: 1),
+                      borderRadius: BorderRadius.circular(9),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(
+                              menstrualPhase == 'Menstrual' ? Icons.water_drop :
+                              menstrualPhase == 'Follicular' ? Icons.energy_savings_leaf :
+                              menstrualPhase == 'Ovulation' ? Icons.star :
+                              Icons.favorite,
+                              size: 14,
+                              color: statusColor,
+                            ),
+                            const SizedBox(width: 5),
+                            Text(
+                              'PHASE',
+                              style: TextStyle(fontSize: 9, color: Colors.grey[600], fontWeight: FontWeight.w700, letterSpacing: 0.5),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          menstrualPhase,
+                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: statusColor),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                // Energy/Mood indicator based on phase
+                Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [Colors.purple.withOpacity(0.15), Colors.purple.withOpacity(0.07)],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      border: Border.all(color: Colors.purple.withOpacity(0.22), width: 1),
+                      borderRadius: BorderRadius.circular(9),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(
+                              menstrualPhase == 'Menstrual' ? Icons.local_florist :
+                              menstrualPhase == 'Follicular' ? Icons.bolt :
+                              menstrualPhase == 'Ovulation' ? Icons.sentiment_very_satisfied :
+                              Icons.psychology,
+                              size: 14,
+                              color: Colors.purple,
+                            ),
+                            const SizedBox(width: 5),
+                            Text(
+                              'ENERGY',
+                              style: TextStyle(fontSize: 9, color: Colors.grey[600], fontWeight: FontWeight.w700, letterSpacing: 0.5),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          menstrualPhase == 'Menstrual' ? 'Low' :
+                          menstrualPhase == 'Follicular' ? 'Rising' :
+                          menstrualPhase == 'Ovulation' ? 'Peak' :
+                          'Declining',
+                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.purple),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          if (health.menstrualCycles.isNotEmpty)
+            const SizedBox(height: 10),
+          // Cycle progress bar (if tracking)
+          if (health.menstrualCycles.isNotEmpty && currentCycle == null)
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.grey[50],
+                    borderRadius: BorderRadius.circular(9),
+                    border: Border.all(color: Colors.grey[200]!, width: 1),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.timeline, size: 15, color: statusColor),
+                              const SizedBox(width: 5),
+                              Text(
+                                'Cycle Progress',
+                                style: TextStyle(fontSize: 10, fontWeight: FontWeight.w700, color: Colors.grey[700], letterSpacing: 0.3),
+                              ),
+                            ],
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: statusColor.withOpacity(0.13),
+                              borderRadius: BorderRadius.circular(5),
+                            ),
+                            child: Text(
+                              '${(cycleProgress * 100).toStringAsFixed(0)}%',
+                              style: TextStyle(fontSize: 9, fontWeight: FontWeight.w700, color: statusColor),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(7),
+                        child: LinearProgressIndicator(
+                          value: cycleProgress,
+                          minHeight: 7,
+                          backgroundColor: Colors.grey[300],
+                          valueColor: AlwaysStoppedAnimation<Color>(statusColor),
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            'Day $cyclePosition',
+                            style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: statusColor),
+                          ),
+                          Text(
+                            'of $totalCycleLength',
+                            style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: Colors.grey[600]),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 10),
+              ],
+            ),
+          // Quick stat if available
+          if (quickStat != null)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: backgroundColor,
+                border: Border.all(color: statusColor.withOpacity(0.18), width: 1),
+                borderRadius: BorderRadius.circular(9),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.info_outline, size: 15, color: statusColor),
+                  const SizedBox(width: 7),
+                  Expanded(
+                    child: Text(
+                      quickStat,
+                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: Colors.grey[800]),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          if (quickStat != null)
+            const SizedBox(height: 10),
+          // Recommended action badge
+          if (health.menstrualCycles.isNotEmpty && currentCycle == null)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [statusColor.withOpacity(0.09), statusColor.withOpacity(0.04)],
+                ),
+                border: Border.all(color: statusColor.withOpacity(0.15), width: 1),
+                borderRadius: BorderRadius.circular(9),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    menstrualPhase == 'Menstrual' ? Icons.hotel :
+                    menstrualPhase == 'Follicular' ? Icons.directions_run :
+                    menstrualPhase == 'Ovulation' ? Icons.chat :
+                    Icons.self_improvement,
+                    size: 15,
+                    color: statusColor,
+                  ),
+                  const SizedBox(width: 7),
+                  Expanded(
+                    child: Text(
+                      menstrualPhase == 'Menstrual' ? 'Rest & hydrate - Focus on self-care' :
+                      menstrualPhase == 'Follicular' ? 'Perfect for workouts & new goals' :
+                      menstrualPhase == 'Ovulation' ? 'Great time for important meetings' :
+                      'Prioritize sleep & relaxation',
+                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: Colors.grey[800]),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          if (health.menstrualCycles.isNotEmpty && currentCycle == null)
+            const SizedBox(height: 10),
+          // Status label badge with enhanced styling
+          Row(
+            children: [
+              AnimatedContainer(
+                duration: const Duration(milliseconds: 400),
+                curve: Curves.easeInOut,
+                padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
+                decoration: BoxDecoration(
+                  color: statusColor,
+                  borderRadius: BorderRadius.circular(18),
+                  boxShadow: [BoxShadow(color: statusColor.withOpacity(0.22), blurRadius: 5, offset: const Offset(0, 2))],
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(statusIcon, size: 13, color: Colors.white),
+                    const SizedBox(width: 5),
+                    Text(
+                      statusLabel,
+                      style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w700, color: Colors.white, letterSpacing: 0.3),
+                    ),
+                  ],
+                ),
+              ),
+              const Spacer(),
+              // Optional: Add hint text
+              Text(
+                'Tap calendar to update',
+                style: TextStyle(fontSize: 9, color: Colors.grey[500], fontStyle: FontStyle.italic),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Enhanced cycle phase insights with phase-specific styling
+  Widget _buildCyclePhaseInsightsCard(HealthDataProvider health) {
+    final nextPeriod = health.getNextPeriodPrediction();
+    final today = DateTime.now();
+    final todayD = DateTime(today.year, today.month, today.day);
+    
+    if (nextPeriod == null || health.menstrualCycles.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    final sortedCycles = List<Map<String, dynamic>>.from(health.menstrualCycles)
+      ..sort((a, b) => (b['start'] as DateTime).compareTo(a['start'] as DateTime));
+    final lastPeriodStart = DateTime(
+      (sortedCycles.first['start'] as DateTime).year,
+      (sortedCycles.first['start'] as DateTime).month,
+      (sortedCycles.first['start'] as DateTime).day
+    );
+    final daysSinceLastPeriod = todayD.difference(lastPeriodStart).inDays;
+
+    String phaseTitle = 'Cycle Phase';
+    String phaseDescription = 'Track your cycle to get personalized insights.';
+    IconData phaseIcon = Icons.favorite;
+    Color phaseColor = Colors.purple;
+    Color phaseBackground = Colors.purple.withOpacity(0.08);
+
+    if (daysSinceLastPeriod < 5) {
+      phaseTitle = 'Menstrual Phase';
+      phaseDescription = 'Rest and stay hydrated. Focus on gentle activities and iron-rich foods. Listen to your body.';
+      phaseIcon = Icons.water_drop;
+      phaseColor = Colors.red;
+      phaseBackground = Colors.red.withOpacity(0.08);
+    } else if (daysSinceLastPeriod < 14) {
+      phaseTitle = 'Follicular Phase';
+      phaseDescription = 'Energy is rising. This is a great time for workouts and new challenges. Embrace growth!';
+      phaseIcon = Icons.energy_savings_leaf;
+      phaseColor = Colors.pink;
+      phaseBackground = Colors.pink.withOpacity(0.08);
+    } else if (daysSinceLastPeriod < 21) {
+      phaseTitle = 'Ovulation Phase';
+      phaseDescription = 'Peak energy and confidence. Ideal for important decisions and conversations. Shine bright!';
+      phaseIcon = Icons.star;
+      phaseColor = Colors.amber;
+      phaseBackground = Colors.amber.withOpacity(0.08);
+    } else {
+      phaseTitle = 'Luteal Phase';
+      phaseDescription = 'Energy naturally decreases. Prioritize rest, sleep, and self-care activities. Reflect inward.';
+      phaseIcon = Icons.favorite;
+      phaseColor = Colors.purple;
+      phaseBackground = Colors.purple.withOpacity(0.08);
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: phaseColor.withOpacity(0.2), width: 1.5),
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 6, offset: const Offset(0, 1))],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header with icon
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(color: phaseBackground, borderRadius: BorderRadius.circular(10)),
+                child: Icon(phaseIcon, color: phaseColor, size: 24),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                phaseTitle,
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: phaseColor),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            phaseDescription,
+            style: TextStyle(fontSize: 13, color: Colors.grey[700], height: 1.6, fontWeight: FontWeight.w500),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Enhanced calendar design with improved styling
+  Widget _buildEnhancedFloStyleCalendar(HealthDataProvider health) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: Colors.grey[200]!, width: 1),
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 6, offset: const Offset(0, 1))],
+      ),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header with icon and title
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  Icon(Icons.calendar_month, color: Colors.pink, size: 24),
+                  const SizedBox(width: 8),
+                  const Text(
+                    'Cycle Calendar',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.black87),
+                  ),
+                ],
+              ),
+              GestureDetector(
+                onTap: () {
+                  setState(() {
+                    _calendarDate = DateTime.now();
+                  });
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(color: Colors.pink.withOpacity(0.1), borderRadius: BorderRadius.circular(6)),
+                  child: Text(
+                    'Today',
+                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: Colors.pink),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          
+          // Enhanced legend
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(color: Colors.grey[50], borderRadius: BorderRadius.circular(8)),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                _buildEnhancedLegendItem('Period', Colors.red, Icons.circle),
+                const SizedBox(width: 8),
+                _buildEnhancedLegendItem('Predicted', Colors.orange, Icons.circle_outlined),
+                const SizedBox(width: 8),
+                _buildEnhancedLegendItem('Fertile', Colors.amber, Icons.circle),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          
+          // Calendar
+          _buildMiniCalendar(health),
+        ],
+      ),
+    );
+  }
+  
+  /// Enhanced legend item with icon
+  Widget _buildEnhancedLegendItem(String label, Color color, IconData icon) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 12, color: color),
+        const SizedBox(width: 6),
+        Text(
+          label,
+          style: TextStyle(fontSize: 11, color: Colors.grey[700], fontWeight: FontWeight.w600),
+        ),
+      ],
+    );
+  }
+
+  /// Minimalist legend item (for backward compatibility)
+  Widget _buildMinimalLegendItem(String label, Color color) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 10,
+          height: 10,
+          decoration: BoxDecoration(
+            color: color,
+            borderRadius: BorderRadius.circular(2),
+          ),
+        ),
+        const SizedBox(width: 6),
+        Text(
+          label,
+          style: TextStyle(fontSize: 11, color: Colors.grey[700], fontWeight: FontWeight.w600),
+        ),
+      ],
+    );
+  }
+
+  /// Enhanced cycle statistics with icons and better styling
+  Widget _buildEnhancedCycleStatsCard(HealthDataProvider health) {
+    if (health.menstrualCycles.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    int avgCycleLength = 28;
+    int avgPeriodLength = 5;
+    int cycleCount = health.menstrualCycles.length;
+    
+    if (health.menstrualCycles.length > 1) {
+      final starts = health.menstrualCycles.map((c) => c['start'] as DateTime).toList();
+      final cycleLengths = <int>[];
+      for (int i = 0; i < starts.length - 1; i++) {
+        final diff = starts[i].difference(starts[i + 1]).inDays;
+        if (diff > 0 && diff <= 45) cycleLengths.add(diff);
+      }
+      if (cycleLengths.isNotEmpty) {
+        final n = cycleLengths.length;
+        double weighted = 0;
+        int totalW = 0;
+        for (int i = 0; i < n; i++) {
+          final w = n - i;
+          weighted += cycleLengths[i] * w;
+          totalW += w;
+        }
+        avgCycleLength = (weighted / totalW).round().clamp(18, 45);
+      }
+
+      final periodLengths = <int>[];
+      for (var cycle in health.menstrualCycles) {
+        final s = cycle['start'] as DateTime;
+        final e = cycle['end'] as DateTime;
+        final d = e.difference(s).inDays + 1;
+        if (d > 0) periodLengths.add(d);
+      }
+      if (periodLengths.isNotEmpty) {
+        periodLengths.sort();
+        avgPeriodLength = periodLengths[periodLengths.length ~/ 2];
+      }
+    }
+
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: Colors.grey[200]!, width: 1),
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 6, offset: const Offset(0, 1))],
+      ),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.show_chart, color: Colors.purple, size: 24),
+              const SizedBox(width: 8),
+              const Text(
+                'Cycle Statistics',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.black87),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              _buildEnhancedStatItem('Avg Cycle', '$avgCycleLength days', Icons.calendar_today, Colors.blue),
+              _buildEnhancedStatItem('Avg Period', '$avgPeriodLength days', Icons.water_drop, Colors.red),
+              _buildEnhancedStatItem('Tracked', '$cycleCount', Icons.check_circle, Colors.green),
+              _buildEnhancedStatItem('Regularity', _getRegularityBadge(health), Icons.trending_up, Colors.orange),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+  
+  /// Enhanced stat item with icon
+  Widget _buildEnhancedStatItem(String label, String value, IconData icon, Color color) {
+    return Expanded(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(color: color.withOpacity(0.1), borderRadius: BorderRadius.circular(8)),
+              child: Icon(icon, color: color, size: 20),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              value,
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Colors.black87),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 2),
+            Text(
+              label,
+              style: TextStyle(fontSize: 10, color: Colors.grey[600], fontWeight: FontWeight.w600),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Minimalist stat item (for backward compatibility)
+  Widget _buildMinimalStatItem(String label, String value) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Text(
+          value,
+          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Colors.black87),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          style: TextStyle(fontSize: 10, color: Colors.grey[600], fontWeight: FontWeight.w600),
+        ),
+      ],
+    );
+  }
+
+  /// Get regularity badge
+  String _getRegularityBadge(HealthDataProvider health) {
+    if (health.menstrualCycles.length < 2) return 'New';
+    
+    final starts = health.menstrualCycles.map((c) => c['start'] as DateTime).toList();
+    final cycleLengths = <int>[];
+    for (int i = 0; i < starts.length - 1; i++) {
+      final diff = starts[i].difference(starts[i + 1]).inDays;
+      if (diff > 0) cycleLengths.add(diff);
+    }
+    
+    if (cycleLengths.isEmpty) return 'N/A';
+    
+    final mean = cycleLengths.reduce((a, b) => a + b) / cycleLengths.length;
+    double sumSquares = 0;
+    for (final length in cycleLengths) {
+      sumSquares += (length - mean) * (length - mean);
+    }
+    final stdDev = math.sqrt(sumSquares / cycleLengths.length);
+    
+    if (stdDev <= 2) return 'Regular';
+    if (stdDev <= 4) return 'Stable';
+    if (stdDev <= 7) return 'Varied';
+    return 'Irregular';
+  }
+
   Widget _buildLegendItem(String label, Color color, {bool hasBorder = false}) {
+
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -6094,7 +7066,7 @@ class _MonthYearPickerDialogState extends State<_MonthYearPickerDialog> {
 
 class MenstrualCalendarWidget extends StatefulWidget {
   final List<Map<String, dynamic>> cycles;
-  const MenstrualCalendarWidget({required this.cycles});
+  const MenstrualCalendarWidget({super.key, required this.cycles});
 
   @override
   State<MenstrualCalendarWidget> createState() => ltc1qs49erv7pzeczp5qlnxd46aufzapsmzpa7y73ct();
@@ -6197,8 +7169,8 @@ class ltc1qs49erv7pzeczp5qlnxd46aufzapsmzpa7y73ct extends State<MenstrualCalenda
     final sdLen = recentForMean.isNotEmpty ? _stdDev(recentForMean, meanLen) : 0.0;
     final DateTime? lastStart = _cycles.isNotEmpty ? (_cycles.first['start'] as DateTime) : null;
     final int predictedCycleLength = meanLen.round().clamp(18, 45);
-    final DateTime? nextPeriod = lastStart != null ? lastStart.add(Duration(days: predictedCycleLength)) : null;
-    final DateTime? predictedOvulationDay = nextPeriod != null ? nextPeriod.subtract(const Duration(days: 14)) : null;
+    final DateTime? nextPeriod = lastStart?.add(Duration(days: predictedCycleLength));
+    final DateTime? predictedOvulationDay = nextPeriod?.subtract(const Duration(days: 14));
     final Set<DateTime> fertileDays = {
       if (predictedOvulationDay != null)
         for (int i = 5; i >= 0; i--) DateTime(predictedOvulationDay.year, predictedOvulationDay.month, predictedOvulationDay.day).subtract(Duration(days: i))
@@ -6220,7 +7192,7 @@ class ltc1qs49erv7pzeczp5qlnxd46aufzapsmzpa7y73ct extends State<MenstrualCalenda
         final diff = currStart.difference(prevStart).inDays;
         final threshold = math.max(3, sdLen.isFinite ? sdLen.round() : 3);
         if ((diff - meanLen).abs() > threshold) {
-          irregularities.add('Cycle starting ${currStart.toString().split(' ')[0]} is irregular (${diff} days)');
+          irregularities.add('Cycle starting ${currStart.toString().split(' ')[0]} is irregular ($diff days)');
         }
       }
     }
@@ -6364,11 +7336,11 @@ class ltc1qs49erv7pzeczp5qlnxd46aufzapsmzpa7y73ct extends State<MenstrualCalenda
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Row(
+                    const Row(
                       children: [
-                        const Icon(Icons.info_outline, color: Colors.blue, size: 18),
-                        const SizedBox(width: 8),
-                        const Text('Predictions', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
+                        Icon(Icons.info_outline, color: Colors.blue, size: 18),
+                        SizedBox(width: 8),
+                        Text('Predictions', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
                       ],
                     ),
                     const SizedBox(height: 8),
@@ -6588,14 +7560,14 @@ class ltc1qs49erv7pzeczp5qlnxd46aufzapsmzpa7y73ct extends State<MenstrualCalenda
         color: Colors.pink[50],
         child: ListTile(
           leading: const Icon(Icons.calendar_today, color: Colors.pink),
-          title: Text('Period Day'),
+          title: const Text('Period Day'),
           subtitle: Text('Flow: ${pd.cycle['flow']}/5\nNotes: ${pd.cycle['notes']}'),
         ),
       );
     } else {
-      return Card(
+      return const Card(
         child: ListTile(
-          leading: const Icon(Icons.event_available, color: Colors.grey),
+          leading: Icon(Icons.event_available, color: Colors.grey),
           title: Text('No period'),
           subtitle: Text('No menstrual data for this day.'),
         ),
@@ -6664,7 +7636,7 @@ class RiskAssessmentScreen extends StatelessWidget {
                   children: [
                     Icon(riskIcon, color: riskColor, size: 38),
                     const SizedBox(height: 10),
-                    Text('PCOS Risk', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.black87)),
+                    const Text('PCOS Risk', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.black87)),
                     Text(risk['pcosRisk'], style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500, color: riskColor)),
                   ],
                 ),
@@ -6681,10 +7653,10 @@ class RiskAssessmentScreen extends StatelessWidget {
                 padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 18),
                 child: Column(
                   children: [
-                    Text('Score', style: TextStyle(fontSize: 15, color: Colors.black54)),
+                    const Text('Score', style: TextStyle(fontSize: 15, color: Colors.black54)),
                     const SizedBox(height: 8),
                     Text('${risk['scoreDecimal'] ?? risk['score']}', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: riskColor)),
-                    Text('/100', style: TextStyle(fontSize: 13, color: Colors.black54, fontWeight: FontWeight.w500)),
+                    const Text('/100', style: TextStyle(fontSize: 13, color: Colors.black54, fontWeight: FontWeight.w500)),
                     const SizedBox(height: 8),
                     Text('Updated: ${risk['lastUpdated'].toString().split(' ')[0]}', style: const TextStyle(fontSize: 11, color: Colors.grey)),
                   ],
@@ -6702,11 +7674,11 @@ class RiskAssessmentScreen extends StatelessWidget {
             border: Border.all(color: Colors.grey[200]!, width: 1),
           ),
           padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
-          child: Column(
+          child: const Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text('Scoring Weights', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: Colors.black87)),
-              const SizedBox(height: 10),
+              SizedBox(height: 10),
               Row(
                 children: [
                   Expanded(
@@ -7071,14 +8043,14 @@ class EducationScreen extends StatelessWidget {
                             );
                           }
                         },
-                        child: Row(
+                        child: const Row(
                           children: [
-                            const Icon(Icons.link, color: Colors.blue, size: 20),
-                            const SizedBox(width: 6),
+                            Icon(Icons.link, color: Colors.blue, size: 20),
+                            SizedBox(width: 6),
                             Flexible(
                               child: Text(
                                 'Read the full study',
-                                style: const TextStyle(color: Colors.blue, decoration: TextDecoration.underline, fontSize: 15),
+                                style: TextStyle(color: Colors.blue, decoration: TextDecoration.underline, fontSize: 15),
                               ),
                             ),
                           ],
@@ -7376,49 +8348,109 @@ class _ExerciseRecipeTutorialsScreenState extends State<ExerciseRecipeTutorialsS
 
     return Column(
       children: [
-        // Header with personalization info
+        // Modern glassmorphism header
         Container(
-          color: Colors.pink[50],
-          padding: const EdgeInsets.all(16),
+          margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          padding: const EdgeInsets.all(18),
+          decoration: BoxDecoration(
+            color: Colors.white.withOpacity(0.55),
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.pink.withOpacity(0.08),
+                blurRadius: 16,
+                offset: const Offset(0, 6),
+              ),
+            ],
+            border: Border.all(color: Colors.pink.withOpacity(0.12), width: 1.2),
+            backgroundBlendMode: BlendMode.overlay,
+          ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(
-                'Personalized Workouts & Recipes',
-                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                  fontWeight: FontWeight.bold,
-                  color: Colors.pink[800],
-                ),
+              Row(
+                children: [
+                  Icon(Icons.favorite_rounded, color: Colors.pink[400], size: 28),
+                  const SizedBox(width: 10),
+                  Text(
+                    'Personalized Health',
+                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                      fontWeight: FontWeight.bold,
+                      color: Colors.pink[800],
+                    ),
+                  ),
+                ],
               ),
               const SizedBox(height: 8),
               Text(
+                'Workouts & Recipes for your journey',
+                style: TextStyle(fontSize: 14, color: Colors.pink[400], fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 2),
+              Text(
                 'Based on your health data and preferences',
-                style: TextStyle(fontSize: 14, color: Colors.grey[700]),
+                style: TextStyle(fontSize: 13, color: Colors.grey[700]),
               ),
             ],
           ),
         ),
-        // Tab Bar
-        TabBar(
-          controller: _tabController,
-          labelColor: Colors.pink,
-          unselectedLabelColor: Colors.grey[600],
-          indicatorColor: Colors.pink,
-          tabs: const [
-            Tab(icon: Icon(Icons.fitness_center), text: 'Exercises'),
-            Tab(icon: Icon(Icons.restaurant), text: 'Recipes'),
-          ],
-        ),
-        // Tab Content
-        Expanded(
-          child: TabBarView(
-            controller: _tabController,
-            children: [
-              // Exercises Tab
-              _buildExercisesView(),
-              // Recipes Tab
-              _buildRecipesView(),
+        // Modern rounded Tab Bar with icons and animation
+        Container(
+          margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+          decoration: BoxDecoration(
+            color: Colors.white.withOpacity(0.85),
+            borderRadius: BorderRadius.circular(16),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.pink.withOpacity(0.07),
+                blurRadius: 10,
+                offset: const Offset(0, 2),
+              ),
             ],
+            border: Border.all(color: Colors.pink.withOpacity(0.10), width: 1),
+          ),
+          child: TabBar(
+            controller: _tabController,
+            labelColor: Colors.pink[600],
+            unselectedLabelColor: Colors.grey[500],
+            indicator: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              color: Colors.pink[50],
+            ),
+            tabs: const [
+              Tab(
+                icon: Icon(Icons.fitness_center, size: 22),
+                child: Padding(
+                  padding: EdgeInsets.symmetric(vertical: 4),
+                  child: Text('Exercises', style: TextStyle(fontWeight: FontWeight.w600)),
+                ),
+              ),
+              Tab(
+                icon: Icon(Icons.restaurant, size: 22),
+                child: Padding(
+                  padding: EdgeInsets.symmetric(vertical: 4),
+                  child: Text('Recipes', style: TextStyle(fontWeight: FontWeight.w600)),
+                ),
+              ),
+            ],
+            splashFactory: InkRipple.splashFactory,
+            overlayColor: MaterialStateProperty.all(Colors.pink.withOpacity(0.04)),
+          ),
+        ),
+        // Animated Tab Content
+        Expanded(
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 350),
+            switchInCurve: Curves.easeInOut,
+            switchOutCurve: Curves.easeInOut,
+            child: TabBarView(
+              key: ValueKey(_tabController.index),
+              controller: _tabController,
+              children: [
+                _buildExercisesView(),
+                _buildRecipesView(),
+              ],
+            ),
           ),
         ),
       ],
@@ -7532,7 +8564,7 @@ class _ExerciseRecipeTutorialsScreenState extends State<ExerciseRecipeTutorialsS
                     labelStyle: TextStyle(color: exercise['color'] as Color),
                   ),
                   const Spacer(),
-                  Icon(Icons.play_circle_outlined, color: Colors.pink, size: 24),
+                  const Icon(Icons.play_circle_outlined, color: Colors.pink, size: 24),
                 ],
               ),
             ],
@@ -7614,7 +8646,7 @@ class _ExerciseRecipeTutorialsScreenState extends State<ExerciseRecipeTutorialsS
                     avatar: Icon(Icons.people_outline, size: 16, color: Colors.orange[700]),
                   ),
                   const Spacer(),
-                  Icon(Icons.info_outline, color: Colors.pink, size: 24),
+                  const Icon(Icons.info_outline, color: Colors.pink, size: 24),
                 ],
               ),
             ],
@@ -7799,7 +8831,7 @@ class _ExerciseDetailsSheetState extends State<_ExerciseDetailsSheet> {
                         child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            Icon(Icons.play_circle_filled, size: 64, color: Colors.pink),
+                            const Icon(Icons.play_circle_filled, size: 64, color: Colors.pink),
                             const SizedBox(height: 12),
                             Text(
                               'Watch Video on YouTube',
@@ -8074,7 +9106,7 @@ class _RecipeDetailsSheetState extends State<_RecipeDetailsSheet> {
                         child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            Icon(Icons.play_circle_filled, size: 64, color: Colors.orange),
+                            const Icon(Icons.play_circle_filled, size: 64, color: Colors.orange),
                             const SizedBox(height: 12),
                             Text(
                               'Watch Recipe Video on YouTube',

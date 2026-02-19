@@ -422,44 +422,44 @@ class KaggleDataService {
 
   /// Get symptoms dataset
   static Future<List<Map<String, dynamic>>> getSymptomsDataset() async {
-    await Future.delayed(Duration(milliseconds: 50));
+    await Future.delayed(const Duration(milliseconds: 50));
     return PCOSMonitoringDatasets.pcosSymptoms;
   }
 
   /// Get treatments dataset
   static Future<List<Map<String, dynamic>>> getTreatmentsDataset() async {
-    await Future.delayed(Duration(milliseconds: 50));
+    await Future.delayed(const Duration(milliseconds: 50));
     return PCOSMonitoringDatasets.treatments;
   }
 
   /// Get lifestyle recommendations dataset
   static Future<List<Map<String, dynamic>>>
       getLifestyleRecommendationsDataset() async {
-    await Future.delayed(Duration(milliseconds: 50));
+    await Future.delayed(const Duration(milliseconds: 50));
     return PCOSMonitoringDatasets.lifestyleRecommendations;
   }
 
   /// Get monitoring metrics dataset
   static Future<List<Map<String, dynamic>>> getMonitoringMetricsDataset() async {
-    await Future.delayed(Duration(milliseconds: 50));
+    await Future.delayed(const Duration(milliseconds: 50));
     return PCOSMonitoringDatasets.monitoringMetrics;
   }
 
   /// Get lab tests dataset
   static Future<List<Map<String, dynamic>>> getLabTestsDataset() async {
-    await Future.delayed(Duration(milliseconds: 50));
+    await Future.delayed(const Duration(milliseconds: 50));
     return PCOSMonitoringDatasets.labTests;
   }
 
   /// Get resources dataset
   static Future<List<Map<String, dynamic>>> getResourcesDataset() async {
-    await Future.delayed(Duration(milliseconds: 50));
+    await Future.delayed(const Duration(milliseconds: 50));
     return PCOSMonitoringDatasets.resources;
   }
 
   /// Get population cycle statistics
   static Future<Map<String, dynamic>> getPopulationStats() async {
-    await Future.delayed(Duration(milliseconds: 50));
+    await Future.delayed(const Duration(milliseconds: 50));
     return PCOSMonitoringDatasets.populationCycleStats;
   }
 
@@ -494,7 +494,7 @@ class KaggleDataService {
 
   /// Validate dataset accuracy and return metadata
   static Future<Map<String, dynamic>> validateDataset(String datasetName) async {
-    await Future.delayed(Duration(milliseconds: 50));
+    await Future.delayed(const Duration(milliseconds: 50));
 
     final metadata = datasetMetadata[datasetName];
     if (metadata == null) {
@@ -521,7 +521,7 @@ class KaggleDataService {
 
   /// Get data accuracy report
   static Future<Map<String, dynamic>> getDataAccuracyReport() async {
-    await Future.delayed(Duration(milliseconds: 100));
+    await Future.delayed(const Duration(milliseconds: 100));
 
     return {
       'report_title': 'PCOS Dataset Accuracy Report',

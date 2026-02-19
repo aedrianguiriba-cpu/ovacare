@@ -85,7 +85,7 @@ class DataService {
     }
 
     // Use embedded PCOS datasets (pure local data, no network)
-    final stats = PCOSMonitoringDatasets.populationCycleStats;
+    const stats = PCOSMonitoringDatasets.populationCycleStats;
     final data = PopulationCycleData(
       averageCycleLength: (stats['average_cycle_length'] as num).toDouble(),
       averagePeriodLength: (stats['average_period_length'] as num).toDouble(),

@@ -1,4 +1,3 @@
-import 'dart:math';
 import 'gemini_moderation_service.dart';
 
 /// Pure Dart + Gemini AI implementation of PCOS content moderation and verification
@@ -38,7 +37,7 @@ class AIModerationService {
   static Future<VerificationResult> verifyPcosContent(
       String title, String content) async {
     // Simulate async operation for future compatibility
-    await Future.delayed(Duration(milliseconds: 100));
+    await Future.delayed(const Duration(milliseconds: 100));
 
     final combinedText = '$title $content'.toLowerCase();
     final words = combinedText
@@ -74,7 +73,7 @@ class AIModerationService {
 
     // More lenient approval for PCOS content
     final hasPcosTerm = termsFound.isNotEmpty;
-    final highConfThreshold = 40.0; // Lowered from 70 for better acceptance
+    const highConfThreshold = 40.0; // Lowered from 70 for better acceptance
     final isApproved = hasMeaningfulContent &&
         (hasPcosTerm || relevanceScore >= highConfThreshold);
 
@@ -239,7 +238,7 @@ class AIModerationService {
         relatedCount += _countOccurrences(fullText, kw);
       }
 
-      final isPcosRelevant = detectedTerms.length >= 1 || relatedCount >= 1;
+      final isPcosRelevant = detectedTerms.isNotEmpty || relatedCount >= 1;
 
       return {
         'approved': isPcosRelevant,
@@ -772,7 +771,7 @@ class ForumRelevanceAnalyzer {
     // Content quality checks
     final contentLength = words.length;
     final hasGoodLength = contentLength >= 5;
-    final isNotAllCaps = true; // No longer check for all caps
+    const isNotAllCaps = true; // No longer check for all caps
     final hasMultipleSentences = RegExp(r'[.!?]').allMatches(combinedText).length >= 2;
     
     // Advanced quality metrics
@@ -853,7 +852,7 @@ class ForumRelevanceAnalyzer {
     final postStructure = _analyzePostStructure(title, content);
     final isWellStructured = (postStructure['isQuestion'] || 
         postStructure['isPersonalExperience'] || 
-        postStructure['isInformative']) as bool;
+        postStructure['isInformative']);
     
     // Check if Gemini detected relevant Tagalog PCOS content
     final geminiApprovedTagalog = (geminiIsTagalog == true && 
@@ -863,7 +862,7 @@ class ForumRelevanceAnalyzer {
     // More lenient approval for PCOS-related content
     // Accept a single detected term or related keyword, lower score thresholds
     final hasPcosKeywords = hasPcosCoreTerm || coreScore > 10;
-    final relaxedScoreThreshold = 20.0;
+    const relaxedScoreThreshold = 20.0;
     // Accept posts with at least one detected PCOS term OR some related keywords
     final detectedTermsCount = _getDetectedTerms(combinedText).length;
     final hasRelatedKeywords = (symptomScore + treatmentScore + lifestyleScore) > 0;
@@ -1316,7 +1315,7 @@ class ForumRelevanceAnalyzer {
     // Check if text maintains focus (not randomly jumping topics)
     final words = text.toLowerCase().split(RegExp(r'\s+'));
     final uniqueWords = words.toSet().length;
-    final wordRepetitionRatio = uniqueWords / (words.length > 0 ? words.length : 1);
+    final wordRepetitionRatio = uniqueWords / (words.isNotEmpty ? words.length : 1);
     
     // Good coherence has some word repetition (0.4-0.7 ratio)
     if (wordRepetitionRatio >= 0.4 && wordRepetitionRatio <= 0.7) {

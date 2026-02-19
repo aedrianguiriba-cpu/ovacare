@@ -1,12 +1,8 @@
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:provider/provider.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'ai_moderation_service.dart';
 import 'dialog_helper.dart';
-import 'report_service.dart';
-import 'main.dart' show HealthDataProvider;
 
 SupabaseClient? _getSupabaseClientOrNull() {
   try {
@@ -188,9 +184,9 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
       floatingActionButton: FloatingActionButton(
         onPressed: _showCreatePostDialog,
         backgroundColor: Colors.pink[400],
-        child: const Icon(Icons.add, color: Colors.white),
         elevation: 4,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        child: const Icon(Icons.add, color: Colors.white),
       ),
     );
   }
@@ -275,15 +271,15 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
       }
     }
 
-    List<String> _topKeys(Map<String,int> counts, [int n = 3]) {
+    List<String> topKeys(Map<String,int> counts, [int n = 3]) {
       final entries = counts.entries.toList();
       entries.sort((a,b) => b.value.compareTo(a.value));
-      return entries.take(n).map((e) => '${e.key}').toList();
+      return entries.take(n).map((e) => e.key).toList();
     }
 
-    final topTags = _topKeys(tagCounts);
-    final topTopics = _topKeys(topicCounts);
-    final topTerms = _topKeys(termCounts);
+    final topTags = topKeys(tagCounts);
+    final topTopics = topKeys(topicCounts);
+    final topTerms = topKeys(termCounts);
 
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -582,7 +578,7 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
                 const SizedBox(height: 12),
                 Row(
                   children: [
-                    Text('Tags (select up to 3)', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.pink)),
+                    const Text('Tags (select up to 3)', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.pink)),
                     const Spacer(),
                     Text('${selectedTags.length}/3', style: const TextStyle(fontSize: 12, color: Colors.black54)),
                   ],
@@ -635,7 +631,7 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
                 ),
                 if (showSuggestions && aiSuggestedTags.isNotEmpty) ...[
                   const SizedBox(height: 8),
-                  Text('AI Suggestions:', style: TextStyle(fontSize: 12, color: Colors.pink)),
+                  const Text('AI Suggestions:', style: TextStyle(fontSize: 12, color: Colors.pink)),
                   Wrap(
                     spacing: 6,
                     children: aiSuggestedTags.map((tag) => ActionChip(

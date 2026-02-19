@@ -26,7 +26,7 @@ class KaggleConfigProvider {
     }
 
     // 2. Check environment variable (from --dart-define or system env)
-    String envValue = String.fromEnvironment('KAGGLE_USERNAME');
+    String envValue = const String.fromEnvironment('KAGGLE_USERNAME');
     if (envValue.isNotEmpty) {
       return envValue;
     }
@@ -42,7 +42,7 @@ class KaggleConfigProvider {
     }
 
     // 2. Check environment variable (from --dart-define or system env)
-    String envValue = String.fromEnvironment('KAGGLE_KEY');
+    String envValue = const String.fromEnvironment('KAGGLE_KEY');
     if (envValue.isNotEmpty) {
       return envValue;
     }
