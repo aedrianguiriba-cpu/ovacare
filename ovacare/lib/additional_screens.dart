@@ -710,9 +710,8 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
                     'tags': tags,
                     'relevance_score': analysis['relevance_score'],
                     'primary_topic': analysis['primary_topic'],
-                    // Write both column names to support older/newer schemas
-                    'detected_terms': analysis['detected_terms'] ?? analysis['detected_terms'],
-                    'detected_terms': analysis['detected_terms'] ?? analysis['detected_terms'],
+                    // Store detected terms
+                    'detected_terms': analysis['detected_terms'] ?? [],
                     'is_pcos_relevant': analysis['is_pcos_relevant'],
                   }).select().single();
 
@@ -798,12 +797,15 @@ class _CommunityForumScreenState extends State<CommunityForumScreen> {
         try {
           final client = _getSupabaseClientOrNull();
           if (client != null) {
-            final user = client.auth.currentUser;
-            
-            // Store content report in database
-            // Note: You'll need to create a content_reports table in Supabase
-            // For now, we'll just show a success message
-            await Future.delayed(const Duration(milliseconds: 500)); // Simulate async operation
+            // Get current user for reporting
+            final currentUser = client.auth.currentUser;
+            if (currentUser != null) {
+              // Store content report in database
+              // Note: You'll need to create a content_reports table in Supabase
+              // For now, we'll just show a success message
+              await Future.delayed(const Duration(milliseconds: 500)); // Simulate async operation
+              print('✅ Post reported by user: ${currentUser.id}');
+            }
           }
           
           if (mounted) {
