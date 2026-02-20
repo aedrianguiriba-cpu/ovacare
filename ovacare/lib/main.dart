@@ -365,9 +365,50 @@ class AuthProvider extends ChangeNotifier {
 }
 
 class HealthDataProvider extends ChangeNotifier {
-      /// Adds a new menstrual cycle with default flow and notes (for calendar tap usage)
-      void addMenstrualCycle(DateTime start, DateTime end) {
-        addMenstrualEntry(start, end, 3, 'Marked from calendar');
+      /// Adds a period day, merging/creating multi-day cycles as needed
+      void addMenstrualCycle(DateTime day) {
+        final target = DateTime(day.year, day.month, day.day);
+        int? prevIdx;
+        int? nextIdx;
+        for (int i = 0; i < menstrualCycles.length; i++) {
+          final start = DateTime(menstrualCycles[i]['start'].year, menstrualCycles[i]['start'].month, menstrualCycles[i]['start'].day);
+          final end = DateTime(menstrualCycles[i]['end'].year, menstrualCycles[i]['end'].month, menstrualCycles[i]['end'].day);
+          if (end.add(const Duration(days: 1)) == target) prevIdx = i;
+          if (start.subtract(const Duration(days: 1)) == target) nextIdx = i;
+          // Already inside a cycle, do nothing
+          if (!target.isBefore(start) && !target.isAfter(end)) return;
+        }
+        if (prevIdx != null && nextIdx != null && prevIdx != nextIdx) {
+          // Merge two cycles with the new day bridging them
+          final prev = menstrualCycles[prevIdx];
+          final next = menstrualCycles[nextIdx];
+          final newStart = DateTime(prev['start'].year, prev['start'].month, prev['start'].day);
+          final newEnd = DateTime(next['end'].year, next['end'].month, next['end'].day);
+          final merged = {
+            'start': newStart,
+            'end': newEnd,
+            'flow': prev['flow'],
+            'notes': '${prev['notes'] ?? ''}; ${next['notes'] ?? ''}'
+          };
+          final hi = prevIdx > nextIdx ? prevIdx : nextIdx;
+          final lo = prevIdx > nextIdx ? nextIdx : prevIdx;
+          menstrualCycles.removeAt(hi);
+          menstrualCycles.removeAt(lo);
+          menstrualCycles.insert(lo, merged);
+        } else if (prevIdx != null) {
+          // Extend previous cycle
+          menstrualCycles[prevIdx]['end'] = target;
+        } else if (nextIdx != null) {
+          // Extend next cycle
+          menstrualCycles[nextIdx]['start'] = target;
+        } else {
+          // New single-day cycle
+          addMenstrualEntry(target, target, 3, 'Marked from calendar');
+          return;
+        }
+        _sortCyclesByStartDesc();
+        _updateRiskAssessment();
+        notifyListeners();
       }
     /// Remove a specific period day from a cycle. If the cycle becomes invalid (start > end), remove it.
     void removePeriodDay(Map<String, dynamic> cycle, DateTime date) {
@@ -771,36 +812,12 @@ class HealthDataProvider extends ChangeNotifier {
     return false;
   }
 
-  // Toggle a single date as a period day. If the date is already inside an
-  // existing cycle, unmark it (shrink/split/remove as needed). If not, create
-  // or merge into adjacent cycles.
-  // Special case: if no cycles exist, the first tap creates the start of the first period.
+  // Toggle a single date as a period day. Marking merges/extends/creates cycles; unmarking splits/shrinks/removes as needed.
   void togglePeriodDay(DateTime date) {
-    // Normalize date to year/month/day (ignore time)
     final target = DateTime(date.year, date.month, date.day);
-
-    // Special case: if this is the VERY FIRST tap (no cycles at all),
-    // create a new cycle starting from this date
-    if (menstrualCycles.isEmpty) {
-      menstrualCycles.insert(0, {
-        'start': target,
-        'end': target,
-        'flow': 3,
-        'notes': 'First period day'
-      });
-      _sortCyclesByStartDesc();
-      _updateRiskAssessment();
-      notifyListeners();
-      return;
-    }
-
-    // Find if date is inside an existing cycle
     for (int i = 0; i < menstrualCycles.length; i++) {
-      final cycle = menstrualCycles[i];
-      DateTime start = cycle['start'] as DateTime;
-      DateTime end = cycle['end'] as DateTime;
-      start = DateTime(start.year, start.month, start.day);
-      end = DateTime(end.year, end.month, end.day);
+      final start = DateTime(menstrualCycles[i]['start'].year, menstrualCycles[i]['start'].month, menstrualCycles[i]['start'].day);
+      final end = DateTime(menstrualCycles[i]['end'].year, menstrualCycles[i]['end'].month, menstrualCycles[i]['end'].day);
       if (!target.isBefore(start) && !target.isAfter(end)) {
         // Unmark: adjust or remove
         if (start == end && start == target) {
@@ -814,9 +831,8 @@ class HealthDataProvider extends ChangeNotifier {
           menstrualCycles[i]['end'] = end.subtract(const Duration(days: 1));
         } else {
           // split the cycle into two
-          final left = {'start': start, 'end': target.subtract(const Duration(days: 1)), 'flow': cycle['flow'], 'notes': cycle['notes']};
-          final right = {'start': target.add(const Duration(days: 1)), 'end': end, 'flow': cycle['flow'], 'notes': cycle['notes']};
-          // replace current with left and insert right after
+          final left = {'start': start, 'end': target.subtract(const Duration(days: 1)), 'flow': menstrualCycles[i]['flow'], 'notes': menstrualCycles[i]['notes']};
+          final right = {'start': target.add(const Duration(days: 1)), 'end': end, 'flow': menstrualCycles[i]['flow'], 'notes': menstrualCycles[i]['notes']};
           menstrualCycles[i] = left;
           menstrualCycles.insert(i + 1, right);
         }
@@ -826,64 +842,8 @@ class HealthDataProvider extends ChangeNotifier {
         return;
       }
     }
-
-    // Not found inside a cycle -> create or merge with adjacent cycles
-    // See if adjacent to previous or next cycle
-    int? prevIndex;
-    int? nextIndex;
-    for (int i = 0; i < menstrualCycles.length; i++) {
-      final cycle = menstrualCycles[i];
-      final start = DateTime((cycle['start'] as DateTime).year, (cycle['start'] as DateTime).month, (cycle['start'] as DateTime).day);
-      final end = DateTime((cycle['end'] as DateTime).year, (cycle['end'] as DateTime).month, (cycle['end'] as DateTime).day);
-      if (end.add(const Duration(days: 1)) == target) prevIndex = i;
-      if (start.subtract(const Duration(days: 1)) == target) nextIndex = i;
-    }
-
-    if (prevIndex != null && nextIndex != null && prevIndex != nextIndex) {
-      // merge prev and next with the target bridging day
-      final prev = menstrualCycles[prevIndex];
-      final next = menstrualCycles[nextIndex > prevIndex ? nextIndex : nextIndex];
-      final newStart = DateTime((prev['start'] as DateTime).year, (prev['start'] as DateTime).month, (prev['start'] as DateTime).day);
-      final newEnd = DateTime((next['end'] as DateTime).year, (next['end'] as DateTime).month, (next['end'] as DateTime).day);
-      // remove both and insert merged at prevIndex
-      final merged = {'start': newStart, 'end': newEnd, 'flow': prev['flow'], 'notes': '${prev['notes'] ?? ''}; ${next['notes'] ?? ''}'};
-      // remove higher index first
-      final hi = prevIndex > nextIndex ? prevIndex : nextIndex;
-      final lo = prevIndex > nextIndex ? nextIndex : prevIndex;
-      menstrualCycles.removeAt(hi);
-      menstrualCycles.removeAt(lo);
-      menstrualCycles.insert(lo, merged);
-      _sortCyclesByStartDesc();
-      _updateRiskAssessment();
-      notifyListeners();
-      return;
-    }
-
-    if (prevIndex != null) {
-      // extend previous cycle end by one day
-      final prev = menstrualCycles[prevIndex];
-      menstrualCycles[prevIndex]['end'] = (prev['end'] as DateTime).add(const Duration(days: 1));
-      _sortCyclesByStartDesc();
-      _updateRiskAssessment();
-      notifyListeners();
-      return;
-    }
-
-    if (nextIndex != null) {
-      // extend next cycle start backward by one day
-      final next = menstrualCycles[nextIndex];
-      menstrualCycles[nextIndex]['start'] = (next['start'] as DateTime).subtract(const Duration(days: 1));
-      _sortCyclesByStartDesc();
-      _updateRiskAssessment();
-      notifyListeners();
-      return;
-    }
-
-    // Otherwise create a new single-day cycle
-    menstrualCycles.insert(0, {'start': target, 'end': target, 'flow': 3, 'notes': 'Marked from calendar'});
-    _sortCyclesByStartDesc();
-    _updateRiskAssessment();
-    notifyListeners();
+    // Not found in any cycle, so mark it
+    addMenstrualCycle(target);
   }
 
   void addSymptom(Map<String, dynamic> symptom) {
@@ -4733,8 +4693,8 @@ class _HealthTrackingScreenState extends State<HealthTrackingScreen> with Ticker
       }
     }
     
-    // Otherwise, add a new single-day cycle
-    health.addMenstrualCycle(normalized, normalized);
+    // Otherwise, add a new cycle with open-ended end
+    health.addMenstrualCycle(normalized);
   }
 
   /// Build premium header section with gradient background
