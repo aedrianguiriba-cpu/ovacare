@@ -458,19 +458,9 @@ class HealthDataProvider extends ChangeNotifier {
   void _initializeServices() async {
     try {
       // Get the current user from Supabase
-      final user = Supabase.instance.client.auth.currentUser;
-      if (user != null) {
-        _currentUserId = user.id;
-        _supabaseService = SupabaseHealthService(Supabase.instance.client);
-        
-        // Load data from Supabase
-        await _loadDataFromSupabase();
-        print('✅ Health data loaded from Supabase for user: $_currentUserId');
-      } else {
-        // Initialize with empty Supabase service
-        _supabaseService = SupabaseHealthService(Supabase.instance.client);
-        print('⚠️ No authenticated user; health data will be stored locally');
-      }
+      // Only use Supabase auth for session management
+      _supabaseService = SupabaseHealthService(Supabase.instance.client);
+      print('✅ Supabase health service initialized');
     } catch (e) {
       print('⚠️ Error initializing Supabase service: $e');
       _supabaseService = SupabaseHealthService(Supabase.instance.client);
@@ -482,19 +472,7 @@ class HealthDataProvider extends ChangeNotifier {
 
   /// Load health data from Supabase database
   Future<void> _loadDataFromSupabase() async {
-    if (_currentUserId == null) return;
-    
-    try {
-      // Load menstrual cycles
-      menstrualCycles = await _supabaseService.fetchMenstrualCycles(_currentUserId!);
-      
-      // Load symptoms
-      symptoms = await _supabaseService.fetchSymptoms(_currentUserId!);
-      
-      notifyListeners();
-    } catch (e) {
-      print('⚠️ Error loading data from Supabase: $e');
-    }
+    // ...existing code...
   }
 
   /// Initialize population data asynchronously
@@ -541,7 +519,7 @@ class HealthDataProvider extends ChangeNotifier {
     final entry = {'start': start, 'end': end, 'flow': flow, 'notes': notes};
     menstrualCycles.insert(0, entry);
     
-    // Sync to Supabase if user is logged in
+       // Sync to Supabase if user is logged in
     if (_currentUserId != null && _isInitialized) {
       _syncMenstrualCyclesToSupabase();
     }
@@ -552,11 +530,13 @@ class HealthDataProvider extends ChangeNotifier {
 
   /// Sync current menstrual cycles to Supabase
   Future<void> _syncMenstrualCyclesToSupabase() async {
-    if (_currentUserId == null) return;
-    
     try {
-      await _supabaseService.replaceMenstrualCycles(_currentUserId!, menstrualCycles);
-      print('✅ Menstrual cycles synced to database');
+      // Upload all menstrual cycles to Supabase
+      await _supabaseService.replaceMenstrualCycles(
+        user_id,
+        menstrualCycles,
+      );
+      print('✅ Menstrual cycles uploaded to Supabase');
     } catch (e) {
       print('⚠️ Error syncing menstrual cycles: $e');
     }
